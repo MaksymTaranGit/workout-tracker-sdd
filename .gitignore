@@ -1,0 +1,8 @@
+# Logs & IDE
+node_modules/
+dist/
+.env
+.DS_Store
+*.log
+.idea/
+.vscode/
