@@ -1,0 +1,1755 @@
+openapi: 3.0.3
+info:
+  title: Workout Volume & Progressive Overload Tracker API
+  version: 1.0.0
+  description: |
+    Формальна специфікація контракту REST API для інформаційної системи обліку механічної роботи (Volume Load) та моніторингу прогресивного перевантаження (Progressive Overload).
+
+    **Джерела істини (Single Source of Truth):**
+    - Базова специфікація: `spec/srs.tex` (`REQ-F-001` – `REQ-F-018`, `REQ-NF-001` – `REQ-NF-010`, `BDD-001` – `BDD-007`)
+    - Офіційне доповнення: `spec/srs-addendum.md` (`REQ-F-019` – `REQ-F-021`, `AC10` – `AC12`)
+    - Документ проєктування API: `docs/api-design.md`
+    - Реєстр ризиків: `docs/risk-register.md` (`RSK-01` – `RSK-09`)
+  contact:
+    name: System Analyst & Tech Lead
+  license:
+    name: Academic / Educational Use Only
+
+
+servers:
+  - url: http://localhost:4010
+    description: Local Prism Mock Server / Development API (v1)
+  - url: https://api.workout-tracker.local
+    description: Production / Staging API (v1)
+
+security: []
+
+tags:
+  - name: Profile
+    description: Управління глобальним профілем користувача та поточною масою тіла (REQ-F-002, REQ-F-019, BDD-001)
+  - name: Exercises
+    description: Довідник (каталог) силових вправ та гранулярне налаштування моделей 1RM (REQ-F-012, REQ-F-013, REQ-F-020)
+  - name: Sessions
+    description: Управління тренувальними сесіями та незмінними знімками маси тіла (REQ-F-001, REQ-F-002, BDD-001)
+  - name: ExerciseBlocks
+    description: Ізольовані блоки виконання вправ у межах сесії (REQ-F-003, REQ-F-006, RSK-09)
+  - name: WorkoutSets
+    description: Фіксація підходів (Auto-Save) та синхронне обчислення Volume Load і 1RM (REQ-F-004 – REQ-F-011, REQ-F-014, REQ-F-021, REQ-NF-001, REQ-NF-003)
+  - name: Analytics
+    description: Аналітичний дашборд динаміки прогресії та розрахунок Дельти (REQ-F-015 – REQ-F-018, REQ-F-021, REQ-NF-002, BDD-005, BDD-007)
+
+paths:
+  /api/v1/profile:
+    get:
+      tags:
+        - Profile
+      operationId: getUserProfile
+      summary: Отримання профілю користувача (REQ-F-002, REQ-F-019)
+      description: |
+        Повертає глобальні налаштування атлета, включно з поточною масою тіла (`current_body_weight`), яка використовується для автоматичного створення `body_weight_snapshot` при старті нової тренувальної сесії.
+        **Пов'язані вимоги:** `REQ-F-002`, `REQ-F-019` (Addendum #1), `AC1`, `AC10`.
+      responses:
+        '200':
+          description: Профіль користувача успішно отримано.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+              examples:
+                defaultProfile:
+                  summary: Стандартний профіль атлета (80.0 кг)
+                  value:
+                    user_id: "018f3a10-0000-7000-8000-000000000001"
+                    current_body_weight: 80.0
+                    unit: "kg"
+                    updated_at: "2026-09-01T08:30:00Z"
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+    put:
+      tags:
+        - Profile
+      operationId: updateUserProfile
+      summary: Оновлення поточної маси тіла в профілі (REQ-F-019, BDD-001)
+      description: |
+        Оновлює поточну масу тіла користувача у профілі (допустимий діапазон `30.0` – `300.0` кг).
+        **Інваріант незмінності:** Зміна ваги в профілі впливає виключно на майбутні сесії та НЕ мутує `body_weight_snapshot` у раніше створених сесіях (`REQ-F-002`, `REQ-F-019`, `BDD-001`, захист від `RSK-06`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserProfileRequest'
+            examples:
+              updateTo85kg:
+                summary: Оновлення маси тіла до 85.0 кг згідно з BDD-001
+                value:
+                  current_body_weight: 85.0
+      responses:
+        '200':
+          description: Масу тіла успішно оновлено.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+              examples:
+                updatedProfileBDD001:
+                  summary: Профіль після оновлення до 85.0 кг (BDD-001)
+                  value:
+                    user_id: "018f3a10-0000-7000-8000-000000000001"
+                    current_body_weight: 85.0
+                    unit: "kg"
+                    updated_at: "2026-10-01T10:15:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '422':
+          description: Порушення доменних обмежень маси тіла (поза межами 30.0..300.0 кг).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidBodyWeight:
+                  summary: Помилка валідації маси тіла (REQ-F-019)
+                  value:
+                    error:
+                      code: "ERR_INVALID_BODY_WEIGHT"
+                      http_status: 422
+                      message: "Маса тіла користувача повинна знаходитися в межах від 30.0 до 300.0 кг згідно з REQ-F-019."
+                      details:
+                        field: "current_body_weight"
+                        rejected_value: 15.0
+                        allowed_min: 30.0
+                        allowed_max: 300.0
+                      trace_id: "trc-profile-422-001"
+
+  /api/v1/exercises:
+    post:
+      tags:
+        - Exercises
+      operationId: createExercise
+      summary: Створення нової вправи в довіднику (REQ-F-012, REQ-F-013, REQ-F-020)
+      description: |
+        Реєструє нову вправу в каталозі із зазначенням назви та біомеханічного типу (`STANDARD`, `BODYWEIGHT`, `ASSISTED`).
+        Якщо математична модель `rm_model` не передана в запиті, сервер автоматично встановлює `"EPLEY"` за замовчуванням (`REQ-F-013`, `AC6`, `AC11`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExerciseRequest'
+            examples:
+              createGravitronExercise:
+                summary: Створення вправи з компенсацією ваги (BDD-002)
+                value:
+                  name: "Підтягування у гравітроні"
+                  exercise_type: "ASSISTED"
+              createStandardSquat:
+                summary: Створення стандартної вправи (BDD-003, BDD-006)
+                value:
+                  name: "Присідання зі штангою"
+                  exercise_type: "STANDARD"
+                  rm_model: "EPLEY"
+      responses:
+        '201':
+          description: Вправу успішно створено в каталозі.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Exercise'
+              examples:
+                createdAssistedExercise:
+                  summary: Створена вправа ASSISTED із дефолтною моделлю EPLEY (REQ-F-013)
+                  value:
+                    exercise_id: "ex-7701-4a2b-9c11-000000000002"
+                    name: "Підтягування у гравітроні"
+                    exercise_type: "ASSISTED"
+                    rm_model: "EPLEY"
+                    created_at: "2026-09-01T09:00:00Z"
+                    updated_at: "2026-09-01T09:00:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '422':
+          description: Конфлікт доменних правил (дублювання назви вправи у каталозі).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                duplicateExerciseName:
+                  summary: Дублікат назви вправи
+                  value:
+                    error:
+                      code: "ERR_DUPLICATE_EXERCISE_NAME"
+                      http_status: 422
+                      message: "Вправа з назвою 'Підтягування у гравітроні' вже існує в каталозі."
+                      details:
+                        field: "name"
+                        rejected_value: "Підтягування у гравітроні"
+                      trace_id: "trc-ex-422-001"
+
+    get:
+      tags:
+        - Exercises
+      operationId: listExercises
+      summary: Отримання списку вправ довідника (REQ-F-020)
+      description: |
+        Повертає перелік усіх зареєстрованих силових вправ каталогу з можливістю фільтрації за біомеханічним типом (`STANDARD`, `BODYWEIGHT`, `ASSISTED`).
+        **Пов'язані вимоги:** `REQ-F-020` (Addendum #2), `AC11`.
+      parameters:
+        - name: exercise_type
+          in: query
+          required: false
+          description: Фільтр за біомеханічним типом вправи
+          schema:
+            $ref: '#/components/schemas/ExerciseType'
+      responses:
+        '200':
+          description: Список вправ успішно повернуто.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExerciseListResponse'
+              examples:
+                catalogList:
+                  summary: Каталог вправ трекера
+                  value:
+                    items:
+                      - exercise_id: "ex-7701-4a2b-9c11-000000000001"
+                        name: "Присідання зі штангою"
+                        exercise_type: "STANDARD"
+                        rm_model: "EPLEY"
+                        created_at: "2026-09-01T08:45:00Z"
+                        updated_at: "2026-09-01T08:45:00Z"
+                      - exercise_id: "ex-7701-4a2b-9c11-000000000002"
+                        name: "Підтягування у гравітроні"
+                        exercise_type: "ASSISTED"
+                        rm_model: "EPLEY"
+                        created_at: "2026-09-01T09:00:00Z"
+                        updated_at: "2026-09-01T09:00:00Z"
+                      - exercise_id: "ex-7701-4a2b-9c11-000000000003"
+                        name: "Станова тяга"
+                        exercise_type: "STANDARD"
+                        rm_model: "EPLEY"
+                        created_at: "2026-09-01T09:10:00Z"
+                        updated_at: "2026-09-01T09:10:00Z"
+                    total: 3
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+  /api/v1/exercises/{exerciseId}:
+    parameters:
+      - $ref: '#/components/parameters/ExerciseIdParam'
+    get:
+      tags:
+        - Exercises
+      operationId: getExerciseById
+      summary: Отримання деталей та конфігурації конкретної вправи (REQ-F-012, REQ-F-020)
+      description: |
+        Повертає метадані вправи з каталогу, включаючи її біомеханічний тип (`exercise_type`) та обрану математичну модель розрахунку 1RM (`rm_model`).
+        **Пов'язані вимоги:** `REQ-F-012`, `REQ-F-020`, `AC11`.
+      responses:
+        '200':
+          description: Деталі вправи успішно повернуто.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Exercise'
+              examples:
+                squatExercise:
+                  summary: Стандартна вправа з моделлю EPLEY
+                  value:
+                    exercise_id: "ex-7701-4a2b-9c11-000000000001"
+                    name: "Присідання зі штангою"
+                    exercise_type: "STANDARD"
+                    rm_model: "EPLEY"
+                    created_at: "2026-09-01T08:45:00Z"
+                    updated_at: "2026-09-01T08:45:00Z"
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+    patch:
+      tags:
+        - Exercises
+      operationId: updateExerciseModel
+      summary: Налаштування математичної моделі 1RM для вправи (REQ-F-012, BDD-006)
+      description: |
+        Дозволяє користувачеві гранулярно змінювати математичну модель розрахунку 1RM (`EPLEY` або `BRZYCKI`) в налаштуваннях конкретної вправи.
+        **Пов'язані вимоги:** `REQ-F-012`, `AC6`, `BDD-006`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateExerciseModelRequest'
+            examples:
+              switchToBrzycki:
+                summary: Перемикання алгоритму 1RM на модель Brzycki
+                value:
+                  rm_model: "BRZYCKI"
+      responses:
+        '200':
+          description: Модель 1RM для вправи успішно оновлено.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Exercise'
+              examples:
+                updatedExerciseBrzycki:
+                  summary: Вправа після перемикання на BRZYCKI
+                  value:
+                    exercise_id: "ex-7701-4a2b-9c11-000000000001"
+                    name: "Присідання зі штангою"
+                    exercise_type: "STANDARD"
+                    rm_model: "BRZYCKI"
+                    created_at: "2026-09-01T08:45:00Z"
+                    updated_at: "2026-09-02T11:20:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/sessions:
+    post:
+      tags:
+        - Sessions
+      operationId: createSession
+      summary: Створення нової тренувальної сесії зі снапшотом ваги (REQ-F-001, REQ-F-002, BDD-001)
+      description: |
+        Створює нову тренувальну сесію та автоматично фіксує поточну масу тіла користувача з його профілю у незмінному (read-only) полі `body_weight_snapshot`.
+        **Пов'язані вимоги:** `REQ-F-001`, `REQ-F-002`, `AC1`, `BDD-001`, нейтралізація ризику `RSK-06`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+            examples:
+              newSessionRequest:
+                summary: Створення сесії силового тренування
+                value:
+                  started_at: "2026-09-15T17:00:00Z"
+                  notes: "Важке силове тренування ніг та спини"
+      responses:
+        '201':
+          description: Сесію створено, знімок маси тіла (body_weight_snapshot) зафіксовано.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkoutSession'
+              examples:
+                createdSessionSnapshot80kg:
+                  summary: Нова сесія зі снапшотом 80.0 кг (BDD-001)
+                  value:
+                    session_id: "ses-9001-2026-0915-000000000001"
+                    started_at: "2026-09-15T17:00:00Z"
+                    body_weight_snapshot: 80.0
+                    notes: "Важке силове тренування ніг та спини"
+                    blocks: []
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '422':
+          description: Неможливо створити сесію через відсутність валідної маси тіла в профілі користувача.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingProfileWeight:
+                  summary: Профіль не містить валідної маси тіла
+                  value:
+                    error:
+                      code: "ERR_PROFILE_WEIGHT_MISSING"
+                      http_status: 422
+                      message: "Неможливо створити сесію: у профілі користувача не встановлено поточну масу тіла (REQ-F-002)."
+                      details:
+                        field: "body_weight_snapshot"
+                      trace_id: "trc-ses-422-001"
+
+    get:
+      tags:
+        - Sessions
+      operationId: listSessions
+      summary: Отримання списку тренувальних сесій (REQ-F-001)
+      description: |
+        Повертає хронологічний список тренувальних сесій користувача з інформацією про зафіксований `body_weight_snapshot` та кількість доданих блоків вправ.
+        **Пов'язані вимоги:** `REQ-F-001`, `REQ-F-002`, `AC1`.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Максимальна кількість записів на сторінку
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          description: Зміщення для пагінації
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Список тренувальних сесій повернуто.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionListResponse'
+              examples:
+                sessionsList:
+                  summary: Історія сесій користувача
+                  value:
+                    items:
+                      - session_id: "ses-9001-2026-0915-000000000001"
+                        started_at: "2026-09-15T17:00:00Z"
+                        body_weight_snapshot: 80.0
+                        notes: "Важке силове тренування ніг та спини"
+                        blocks_count: 2
+                      - session_id: "ses-9001-2026-0908-000000000001"
+                        started_at: "2026-09-08T18:00:00Z"
+                        body_weight_snapshot: 80.0
+                        notes: "Базове тренування"
+                        blocks_count: 1
+                    total: 2
+                    limit: 20
+                    offset: 0
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+  /api/v1/sessions/{sessionId}:
+    parameters:
+      - $ref: '#/components/parameters/SessionIdParam'
+    get:
+      tags:
+        - Sessions
+      operationId: getSessionById
+      summary: Отримання детального стану сесії з усіма блоками та підходами (REQ-F-001 – REQ-F-016, BDD-001, BDD-003, BDD-006)
+      description: |
+        Повертає повну структуру тренувальної сесії з незмінним `body_weight_snapshot`, масивом ізольованих блоків вправ (`blocks`), підходами (`sets`) та обчисленими метриками Volume Load, 1RM та Дельти.
+        **Пов'язані вимоги:** `REQ-F-001` – `REQ-F-016`, `BDD-001`, `BDD-003` (ігнорування розминки), `BDD-006` (еталон Epley `116.66` кг).
+      responses:
+        '200':
+          description: Детальні дані сесії успішно повернуто.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkoutSession'
+              examples:
+                sessionWithWarmupAndEpleyBenchmark:
+                  summary: "Сесія з розминочним і робочим підходом (BDD-001, BDD-003: VL=500.0 кг, BDD-006: 1RM=116.66 кг)"
+                  value:
+                    session_id: "ses-9001-2026-0915-000000000001"
+                    started_at: "2026-09-15T17:00:00Z"
+                    body_weight_snapshot: 80.0
+                    notes: "Важке силове тренування ніг та спини"
+                    blocks:
+                      - block_id: "blk-1001-0001"
+                        session_id: "ses-9001-2026-0915-000000000001"
+                        exercise_id: "ex-7701-4a2b-9c11-000000000001"
+                        exercise_name: "Присідання зі штангою"
+                        exercise_type: "STANDARD"
+                        rm_model: "EPLEY"
+                        order_index: 1
+                        block_volume_load: 500.0
+                        block_max_1rm: 116.66
+                        has_previous_baseline: true
+                        volume_load_delta: 50.0
+                        max_1rm_delta: 2.5
+                        sets:
+                          - set_id: "set-5001"
+                            block_id: "blk-1001-0001"
+                            set_number: 1
+                            weight: 60.0
+                            effective_weight: 60.0
+                            reps: 10
+                            rpe: 6.5
+                            is_warmup: true
+                            set_volume_load: 0.0
+                            estimated_1rm: null
+                            soft_constraint_warning: false
+                            warning_message: null
+                          - set_id: "set-5002"
+                            block_id: "blk-1001-0001"
+                            set_number: 2
+                            weight: 100.0
+                            effective_weight: 100.0
+                            reps: 5
+                            rpe: 8.5
+                            is_warmup: false
+                            set_volume_load: 500.0
+                            estimated_1rm: 116.66
+                            soft_constraint_warning: false
+                            warning_message: null
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/sessions/{sessionId}/blocks:
+    parameters:
+      - $ref: '#/components/parameters/SessionIdParam'
+    post:
+      tags:
+        - ExerciseBlocks
+      operationId: createExerciseBlock
+      summary: Додавання нового ізольованого блоку вправи до сесії (REQ-F-003, REQ-F-006, RSK-09)
+      description: |
+        Додає вправу з каталогу до тренувальної сесії як ізольований блок (`ExerciseBlock`).
+        Згідно з `REQ-F-006` та заходом пом'якшення ризику `RSK-09`, якщо ту саму вправу додано двічі в одну сесію, створюються два окремі блоки з різними `block_id`, і їхній `block_volume_load` не сумується між собою.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExerciseBlockRequest'
+            examples:
+              addGravitronBlock:
+                summary: Додавання блоку підтягувань у гравітроні
+                value:
+                  exercise_id: "ex-7701-4a2b-9c11-000000000002"
+      responses:
+        '201':
+          description: Ізольований блок вправи успішно створено в сесії.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExerciseBlock'
+              examples:
+                createdBlock:
+                  summary: Створений порожній блок вправи в сесії
+                  value:
+                    block_id: "blk-1001-0002"
+                    session_id: "ses-9001-2026-0915-000000000001"
+                    exercise_id: "ex-7701-4a2b-9c11-000000000002"
+                    exercise_name: "Підтягування у гравітроні"
+                    exercise_type: "ASSISTED"
+                    rm_model: "EPLEY"
+                    order_index: 2
+                    block_volume_load: 0.0
+                    block_max_1rm: null
+                    has_previous_baseline: false
+                    volume_load_delta: null
+                    max_1rm_delta: null
+                    sets: []
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/sessions/{sessionId}/blocks/{blockId}:
+    parameters:
+      - $ref: '#/components/parameters/SessionIdParam'
+      - $ref: '#/components/parameters/BlockIdParam'
+    get:
+      tags:
+        - ExerciseBlocks
+      operationId: getExerciseBlockById
+      summary: Отримання даних конкретного блоку вправи, його об'єму та Дельти (REQ-F-006, REQ-F-015, REQ-F-016)
+      description: |
+        Повертає актуальний стан конкретного ізольованого блоку вправи разом з усіма його підходами, сумарним `block_volume_load` (`REQ-F-006`), максимальним 1RM (`REQ-F-011`) та розрахованими Дельтами відносно попереднього хронологічного виконання (`REQ-F-015`, `REQ-F-016`, `REQ-F-018`, `REQ-F-021`).
+      responses:
+        '200':
+          description: Дані блоку вправи успішно повернуто.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExerciseBlock'
+              examples:
+                squatBlockBDD003AndBDD006:
+                  summary: "Блок присідань із розминочним та робочим підходом (BDD-003: VL=500.0 кг, BDD-006: 1RM=116.66 кг)"
+                  value:
+                    block_id: "blk-1001-0001"
+                    session_id: "ses-9001-2026-0915-000000000001"
+                    exercise_id: "ex-7701-4a2b-9c11-000000000001"
+                    exercise_name: "Присідання зі штангою"
+                    exercise_type: "STANDARD"
+                    rm_model: "EPLEY"
+                    order_index: 1
+                    block_volume_load: 500.0
+                    block_max_1rm: 116.66
+                    has_previous_baseline: true
+                    volume_load_delta: 50.0
+                    max_1rm_delta: 2.5
+                    sets:
+                      - set_id: "set-5001"
+                        block_id: "blk-1001-0001"
+                        set_number: 1
+                        weight: 60.0
+                        effective_weight: 60.0
+                        reps: 10
+                        rpe: 6.5
+                        is_warmup: true
+                        set_volume_load: 0.0
+                        estimated_1rm: null
+                        soft_constraint_warning: false
+                        warning_message: null
+                      - set_id: "set-5002"
+                        block_id: "blk-1001-0001"
+                        set_number: 2
+                        weight: 100.0
+                        effective_weight: 100.0
+                        reps: 5
+                        rpe: 8.5
+                        is_warmup: false
+                        set_volume_load: 500.0
+                        estimated_1rm: 116.66
+                        soft_constraint_warning: false
+                        warning_message: null
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/sessions/{sessionId}/blocks/{blockId}/sets:
+    parameters:
+      - $ref: '#/components/parameters/SessionIdParam'
+      - $ref: '#/components/parameters/BlockIdParam'
+    post:
+      tags:
+        - WorkoutSets
+      operationId: createWorkoutSet
+      summary: Запис (Auto-Save) підходу з миттєвим обчисленням Volume Load, 1RM та Дельти (REQ-F-004 – REQ-F-011, REQ-F-014, REQ-F-021, REQ-NF-001, REQ-NF-003)
+      description: |
+        Зберігає новий підхід у межах блоку вправи (`REQ-NF-003` auto-save) та синхронно за час `< 100 мс` (`REQ-NF-001`) виконує розрахунок:
+        - `effective_weight` та `set_volume_load` (`REQ-F-006` – `REQ-F-010`, `0.0` для `is_warmup=true`);
+        - `estimated_1rm` за моделлю вправи Epley або Brzycki (`REQ-F-011`, `REQ-F-021`, `null` для `is_warmup=true`);
+        - прапорця `soft_constraint_warning = true`, якщо `reps > 10` (`REQ-F-014`, `BDD-004`);
+        - оновлених агрегатів блоку `block_summary` (`block_volume_load`, `block_max_1rm`, `volume_load_delta`, `max_1rm_delta`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkoutSetRequest'
+            examples:
+              epleyBenchmarkSetBDD006:
+                summary: BDD-006 — Робочий підхід 100 кг на 5 повторень (Epley)
+                value:
+                  weight: 100.0
+                  reps: 5
+                  rpe: 8.5
+                  is_warmup: false
+              gravitronAssistedSetBDD002:
+                summary: BDD-002 — Підхід у гравітроні з компенсацією -20 кг на 10 повторень
+                value:
+                  weight: -20.0
+                  reps: 10
+                  rpe: 8.0
+                  is_warmup: false
+              warmupSetBDD003:
+                summary: BDD-003 — Розминочний підхід 60 кг на 10 повторень (is_warmup=true)
+                value:
+                  weight: 60.0
+                  reps: 10
+                  rpe: 6.5
+                  is_warmup: true
+              softConstraintSetBDD004:
+                summary: BDD-004 — Підхід 100 кг на 12 повторень (Soft Constraint > 10 повторень)
+                value:
+                  weight: 100.0
+                  reps: 12
+                  rpe: 9.0
+                  is_warmup: false
+      responses:
+        '201':
+          description: Підхід успішно збережено, розрахункові метрики підходу та блоку повернуто.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateWorkoutSetResponse'
+              examples:
+                bdd006EpleyResult:
+                  summary: BDD-006 — Еталонний розрахунок Epley (100 кг × 5 повт. -> 1RM = 116.66 кг, VL = 500.0 кг)
+                  value:
+                    set:
+                      set_id: "set-5002"
+                      block_id: "blk-1001-0001"
+                      set_number: 2
+                      weight: 100.0
+                      effective_weight: 100.0
+                      reps: 5
+                      rpe: 8.5
+                      is_warmup: false
+                      set_volume_load: 500.0
+                      estimated_1rm: 116.66
+                      soft_constraint_warning: false
+                      warning_message: null
+                    block_summary:
+                      block_id: "blk-1001-0001"
+                      block_volume_load: 500.0
+                      block_max_1rm: 116.66
+                      has_previous_baseline: true
+                      volume_load_delta: 50.0
+                      max_1rm_delta: 2.5
+                bdd002GravitronResult:
+                  summary: BDD-002 — Вправа з компенсацією у гравітроні ((80 + (-20)) * 10 = 600.0 кг)
+                  value:
+                    set:
+                      set_id: "set-5004"
+                      block_id: "blk-1001-0002"
+                      set_number: 1
+                      weight: -20.0
+                      effective_weight: 60.0
+                      reps: 10
+                      rpe: 8.0
+                      is_warmup: false
+                      set_volume_load: 600.0
+                      estimated_1rm: 80.0
+                      soft_constraint_warning: false
+                      warning_message: null
+                    block_summary:
+                      block_id: "blk-1001-0002"
+                      block_volume_load: 600.0
+                      block_max_1rm: 80.0
+                      has_previous_baseline: false
+                      volume_load_delta: null
+                      max_1rm_delta: null
+                bdd004SoftConstraintResult:
+                  summary: BDD-004 — Soft Constraint при високій кількості повторень (100 кг × 12 повт.)
+                  value:
+                    set:
+                      set_id: "set-5003"
+                      block_id: "blk-1001-0001"
+                      set_number: 1
+                      weight: 100.0
+                      effective_weight: 100.0
+                      reps: 12
+                      rpe: 9.0
+                      is_warmup: false
+                      set_volume_load: 1200.0
+                      estimated_1rm: 140.0
+                      soft_constraint_warning: true
+                      warning_message: "Кількість повторень перевищує 10 (R=12). Розрахункове значення 1RM має знижену точність (REQ-F-014)."
+                    block_summary:
+                      block_id: "blk-1001-0001"
+                      block_volume_load: 1200.0
+                      block_max_1rm: 140.0
+                      has_previous_baseline: true
+                      volume_load_delta: 100.0
+                      max_1rm_delta: 5.0
+                bdd003WarmupIgnoredResult:
+                  summary: BDD-003 — Ігнорування розминочного підходу (set_volume_load = 0.0, estimated_1rm = null)
+                  value:
+                    set:
+                      set_id: "set-5001"
+                      block_id: "blk-1001-0001"
+                      set_number: 1
+                      weight: 60.0
+                      effective_weight: 60.0
+                      reps: 10
+                      rpe: 6.5
+                      is_warmup: true
+                      set_volume_load: 0.0
+                      estimated_1rm: null
+                      soft_constraint_warning: false
+                      warning_message: null
+                    block_summary:
+                      block_id: "blk-1001-0001"
+                      block_volume_load: 0.0
+                      block_max_1rm: null
+                      has_previous_baseline: true
+                      volume_load_delta: -450.0
+                      max_1rm_delta: null
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          description: Порушення доменних бізнес-правил SRS або обмежень безпеки математичних моделей (RSK-02, RSK-07).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                rpeOutOfRange:
+                  summary: ERR_RPE_OUT_OF_RANGE — RPE поза діапазоном 6.0..10.0 (REQ-F-004)
+                  value:
+                    error:
+                      code: "ERR_RPE_OUT_OF_RANGE"
+                      http_status: 422
+                      message: "Показник RPE повинен знаходитися в діапазоні від 6.0 до 10.0 згідно з REQ-F-004."
+                      details:
+                        field: "rpe"
+                        rejected_value: 5.5
+                        allowed_min: 6.0
+                        allowed_max: 10.0
+                      trace_id: "trc-set-422-rpe"
+                brzyckiMathLimit:
+                  summary: ERR_BRZYCKI_MATHEMATICAL_LIMIT — Кількість повторень >= 37 (RSK-02)
+                  value:
+                    error:
+                      code: "ERR_BRZYCKI_MATHEMATICAL_LIMIT"
+                      http_status: 422
+                      message: "Кількість повторень не може перевищувати 36 (при R >= 37 формула Brzycki викликає ділення на нуль або від'ємний 1RM, RSK-02)."
+                      details:
+                        field: "reps"
+                        rejected_value: 37
+                        allowed_min: 1
+                        allowed_max: 36
+                      trace_id: "trc-set-422-brzycki"
+                negativeWeightNotAllowed:
+                  summary: ERR_NEGATIVE_WEIGHT_NOT_ALLOWED — Порушення знаку ваги для STANDARD/BODYWEIGHT (REQ-F-008, REQ-F-009)
+                  value:
+                    error:
+                      code: "ERR_NEGATIVE_WEIGHT_NOT_ALLOWED"
+                      http_status: 422
+                      message: "Для вправ типу STANDARD вага має бути суворо більшою за 0 (для BODYWEIGHT >= 0). Від'ємна вага дозволена лише для ASSISTED."
+                      details:
+                        field: "weight"
+                        exercise_type: "STANDARD"
+                        rejected_value: -10.0
+                      trace_id: "trc-set-422-sign"
+                nonPositiveEffectiveLoad:
+                  summary: ERR_NON_POSITIVE_EFFECTIVE_LOAD — Компенсація у гравітроні перевищує масу тіла (RSK-07)
+                  value:
+                    error:
+                      code: "ERR_NON_POSITIVE_EFFECTIVE_LOAD"
+                      http_status: 422
+                      message: "Ефективне навантаження (body_weight_snapshot + weight) повинно бути суворо більшим за 0 кг (REQ-F-010, RSK-07)."
+                      details:
+                        field: "weight"
+                        body_weight_snapshot: 80.0
+                        rejected_value: -85.0
+                        effective_weight: -5.0
+                      trace_id: "trc-set-422-effload"
+
+  /api/v1/sessions/{sessionId}/blocks/{blockId}/sets/{setId}:
+    parameters:
+      - $ref: '#/components/parameters/SessionIdParam'
+      - $ref: '#/components/parameters/BlockIdParam'
+      - $ref: '#/components/parameters/SetIdParam'
+    delete:
+      tags:
+        - WorkoutSets
+      operationId: deleteWorkoutSet
+      summary: Видалення помилково введеного підходу з перерахунком блоку (REQ-F-004, REQ-F-006)
+      description: |
+        Видаляє підхід із блоку вправи та синхронно перераховує агреговані показники блоку (`block_volume_load`, `block_max_1rm`, `volume_load_delta`, `max_1rm_delta`).
+        **Пов'язані вимоги:** `REQ-F-004`, `REQ-F-006`, `REQ-F-015`, `REQ-F-016`.
+      responses:
+        '200':
+          description: Підхід успішно видалено, повернено оновлене зведення блоку.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteWorkoutSetResponse'
+              examples:
+                deletedSetSummary:
+                  summary: Стан блоку після видалення єдиного підходу
+                  value:
+                    deleted_set_id: "set-5004"
+                    block_summary:
+                      block_id: "blk-1001-0002"
+                      block_volume_load: 0.0
+                      block_max_1rm: null
+                      has_previous_baseline: false
+                      volume_load_delta: null
+                      max_1rm_delta: null
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/exercises/{exerciseId}/analytics:
+    parameters:
+      - $ref: '#/components/parameters/ExerciseIdParam'
+    get:
+      tags:
+        - Analytics
+      operationId: getExerciseAnalytics
+      summary: Отримання даних дашборду динаміки Volume Load, 1RM та Дельти (REQ-F-015 – REQ-F-018, BDD-005, BDD-007)
+      description: |
+        Повертає аналітичний дашборд для конкретної вправи:
+        - `latest_progression`: порівняння останнього виконання з попереднім хронологічним виконанням (`volume_load_delta`, `max_1rm_delta` згідно з `REQ-F-015`, `REQ-F-016`, `REQ-F-018`, `REQ-F-021`, `BDD-005`);
+        - `data_points`: впорядкований часовий ряд для побудови лінійного графіка динаміки Volume Load та максимального 1RM (`REQ-F-017`, `BDD-007`).
+        Час формування відповіді `< 1 с` згідно з `REQ-NF-002`.
+      parameters:
+        - name: from_date
+          in: query
+          required: false
+          description: Початкова дата вибірки (ISO 8601)
+          schema:
+            type: string
+            format: date
+        - name: to_date
+          in: query
+          required: false
+          description: Кінцева дата вибірки (ISO 8601)
+          schema:
+            type: string
+            format: date
+        - name: limit
+          in: query
+          required: false
+          description: Максимальна кількість історичних точок для графіка
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: Аналітичні дані дашборду успішно сформовано.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExerciseAnalyticsResponse'
+              examples:
+                deadliftProgressionBDD005AndBDD007:
+                  summary: BDD-005 та BDD-007 — Динаміка "Станової тяги" за 3 сесії (3000 -> 3200 -> 3300 кг, Дельта = +100.0 кг)
+                  value:
+                    exercise_id: "ex-7701-4a2b-9c11-000000000003"
+                    exercise_name: "Станова тяга"
+                    exercise_type: "STANDARD"
+                    rm_model: "EPLEY"
+                    latest_progression:
+                      has_previous_baseline: true
+                      current_block_id: "blk-3003"
+                      previous_block_id: "blk-2002"
+                      current_volume_load: 3300.0
+                      previous_volume_load: 3200.0
+                      volume_load_delta: 100.0
+                      current_max_1rm: 195.0
+                      previous_max_1rm: 190.0
+                      max_1rm_delta: 5.0
+                    data_points:
+                      - session_id: "ses-01"
+                        block_id: "blk-1001"
+                        performed_at: "2026-09-01T18:00:00Z"
+                        body_weight_snapshot: 80.0
+                        block_volume_load: 3000.0
+                        block_max_1rm: 185.0
+                        volume_load_delta: null
+                        max_1rm_delta: null
+                      - session_id: "ses-02"
+                        block_id: "blk-2002"
+                        performed_at: "2026-09-08T18:00:00Z"
+                        body_weight_snapshot: 80.0
+                        block_volume_load: 3200.0
+                        block_max_1rm: 190.0
+                        volume_load_delta: 200.0
+                        max_1rm_delta: 5.0
+                      - session_id: "ses-03"
+                        block_id: "blk-3003"
+                        performed_at: "2026-09-15T18:00:00Z"
+                        body_weight_snapshot: 80.0
+                        block_volume_load: 3300.0
+                        block_max_1rm: 195.0
+                        volume_load_delta: 100.0
+                        max_1rm_delta: 5.0
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+components:
+  parameters:
+    ExerciseIdParam:
+      name: exerciseId
+      in: path
+      required: true
+      description: Унікальний ідентифікатор вправи в каталозі
+      schema:
+        type: string
+        minLength: 1
+    SessionIdParam:
+      name: sessionId
+      in: path
+      required: true
+      description: Унікальний ідентифікатор тренувальної сесії
+      schema:
+        type: string
+        minLength: 1
+    BlockIdParam:
+      name: blockId
+      in: path
+      required: true
+      description: Унікальний ідентифікатор ізольованого блоку вправи у сесії
+      schema:
+        type: string
+        minLength: 1
+    SetIdParam:
+      name: setId
+      in: path
+      required: true
+      description: Унікальний ідентифікатор підходу в межах блоку вправи
+      schema:
+        type: string
+        minLength: 1
+
+  responses:
+    BadRequestError:
+      description: Синтаксична або структурна помилка HTTP-запиту (невалідний JSON, відсутні обов'язкові поля або невірний примітивний тип).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            malformedRequest:
+              summary: Відсутнє обов'язкове поле або невірний тип даних
+              value:
+                error:
+                  code: "ERR_BAD_REQUEST"
+                  http_status: 400
+                  message: "Некоректна структура запиту: відсутнє обов'язкове поле або передано невірний тип даних."
+                  details:
+                    field: "reps"
+                    issue: "Expected integer, received string"
+                  trace_id: "trc-400-generic"
+
+    NotFoundError:
+      description: Запитуваний ресурс (вправу, сесію, блок або підхід) не знайдено.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            resourceNotFound:
+              summary: Ресурс із вказаним ID не існує
+              value:
+                error:
+                  code: "ERR_RESOURCE_NOT_FOUND"
+                  http_status: 404
+                  message: "Запитуваний ресурс не знайдено у базі даних."
+                  details:
+                    resource_id: "unknown-id-999"
+                  trace_id: "trc-404-generic"
+
+  schemas:
+    ExerciseType:
+      type: string
+      description: Біомеханічний тип силової вправи (Глосарій SRS, REQ-F-020)
+      enum:
+        - STANDARD
+        - BODYWEIGHT
+        - ASSISTED
+
+    RmModel:
+      type: string
+      description: Математична модель розрахунку одноповторного максимуму 1RM (REQ-F-012, REQ-F-013)
+      enum:
+        - EPLEY
+        - BRZYCKI
+      default: EPLEY
+
+    UserProfile:
+      type: object
+      description: Глобальний профіль користувача (Глосарій SRS, REQ-F-019)
+      required:
+        - user_id
+        - current_body_weight
+        - unit
+        - updated_at
+      properties:
+        user_id:
+          type: string
+          readOnly: true
+          example: "018f3a10-0000-7000-8000-000000000001"
+        current_body_weight:
+          type: number
+          format: double
+          minimum: 30.0
+          maximum: 300.0
+          description: Поточна маса тіла користувача в кг (REQ-F-019)
+          example: 80.0
+        unit:
+          type: string
+          readOnly: true
+          enum:
+            - kg
+          default: kg
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          example: "2026-09-01T08:30:00Z"
+
+    UpdateUserProfileRequest:
+      type: object
+      description: Запит на оновлення поточної маси тіла в профілі (REQ-F-019, BDD-001)
+      required:
+        - current_body_weight
+      properties:
+        current_body_weight:
+          type: number
+          format: double
+          minimum: 30.0
+          maximum: 300.0
+          description: Нове значення маси тіла в діапазоні 30.0..300.0 кг
+          example: 85.0
+
+    CreateExerciseRequest:
+      type: object
+      description: Запит на створення нової вправи в каталозі (REQ-F-012, REQ-F-013, REQ-F-020)
+      required:
+        - name
+        - exercise_type
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 120
+          description: Унікальна назва вправи
+          example: "Підтягування у гравітроні"
+        exercise_type:
+          $ref: '#/components/schemas/ExerciseType'
+        rm_model:
+          $ref: '#/components/schemas/RmModel'
+
+    UpdateExerciseModelRequest:
+      type: object
+      description: Запит на зміну математичної моделі 1RM для конкретної вправи (REQ-F-012)
+      required:
+        - rm_model
+      properties:
+        rm_model:
+          $ref: '#/components/schemas/RmModel'
+
+    Exercise:
+      type: object
+      description: Сутність вправи в довіднику (REQ-F-012, REQ-F-013, REQ-F-020)
+      required:
+        - exercise_id
+        - name
+        - exercise_type
+        - rm_model
+        - created_at
+      properties:
+        exercise_id:
+          type: string
+          readOnly: true
+          example: "ex-7701-4a2b-9c11-000000000001"
+        name:
+          type: string
+          minLength: 2
+          maxLength: 120
+          example: "Присідання зі штангою"
+        exercise_type:
+          $ref: '#/components/schemas/ExerciseType'
+        rm_model:
+          $ref: '#/components/schemas/RmModel'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          example: "2026-09-01T08:45:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          example: "2026-09-01T08:45:00Z"
+
+    ExerciseListResponse:
+      type: object
+      required:
+        - items
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Exercise'
+        total:
+          type: integer
+          minimum: 0
+          readOnly: true
+          example: 3
+
+    CreateSessionRequest:
+      type: object
+      description: Параметри створення нової тренувальної сесії (REQ-F-001)
+      properties:
+        started_at:
+          type: string
+          format: date-time
+          description: Час початку тренування (за замовчуванням — поточний UTC час сервера)
+          example: "2026-09-15T17:00:00Z"
+        notes:
+          type: string
+          maxLength: 500
+          nullable: true
+          example: "Важке силове тренування ніг та спини"
+
+    WorkoutSessionSummary:
+      type: object
+      description: Коротке представлення тренувальної сесії у списку
+      required:
+        - session_id
+        - started_at
+        - body_weight_snapshot
+        - blocks_count
+      properties:
+        session_id:
+          type: string
+          readOnly: true
+          example: "ses-9001-2026-0915-000000000001"
+        started_at:
+          type: string
+          format: date-time
+          example: "2026-09-15T17:00:00Z"
+        body_weight_snapshot:
+          type: number
+          format: double
+          readOnly: true
+          minimum: 30.0
+          maximum: 300.0
+          description: Незмінний знімок маси тіла користувача на момент створення сесії (REQ-F-002, BDD-001)
+          example: 80.0
+        notes:
+          type: string
+          nullable: true
+          example: "Важке силове тренування ніг та спини"
+        blocks_count:
+          type: integer
+          minimum: 0
+          readOnly: true
+          example: 2
+
+    SessionListResponse:
+      type: object
+      required:
+        - items
+        - total
+        - limit
+        - offset
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkoutSessionSummary'
+        total:
+          type: integer
+          minimum: 0
+          readOnly: true
+          example: 2
+        limit:
+          type: integer
+          minimum: 1
+          example: 20
+        offset:
+          type: integer
+          minimum: 0
+          example: 0
+
+    WorkoutSession:
+      type: object
+      description: Повна модель тренувальної сесії з ізольованими блоками вправ (REQ-F-001, REQ-F-002)
+      required:
+        - session_id
+        - started_at
+        - body_weight_snapshot
+        - blocks
+      properties:
+        session_id:
+          type: string
+          readOnly: true
+          example: "ses-9001-2026-0915-000000000001"
+        started_at:
+          type: string
+          format: date-time
+          example: "2026-09-15T17:00:00Z"
+        body_weight_snapshot:
+          type: number
+          format: double
+          readOnly: true
+          minimum: 30.0
+          maximum: 300.0
+          description: Незмінний (immutable) знімок маси тіла користувача в кг (REQ-F-002, RSK-06)
+          example: 80.0
+        notes:
+          type: string
+          nullable: true
+          example: "Важке силове тренування ніг та спини"
+        blocks:
+          type: array
+          readOnly: true
+          items:
+            $ref: '#/components/schemas/ExerciseBlock'
+
+    CreateExerciseBlockRequest:
+      type: object
+      description: Запит на додавання ізольованого блоку вправи до сесії (REQ-F-003, REQ-F-006)
+      required:
+        - exercise_id
+      properties:
+        exercise_id:
+          type: string
+          minLength: 1
+          description: Ідентифікатор вправи з каталогу
+          example: "ex-7701-4a2b-9c11-000000000002"
+
+    ExerciseBlockSummary:
+      type: object
+      description: Розрахункове зведення агрегатів ізольованого блоку вправи (REQ-F-006, REQ-F-015, REQ-F-016, REQ-F-018)
+      required:
+        - block_id
+        - block_volume_load
+        - block_max_1rm
+        - has_previous_baseline
+        - volume_load_delta
+        - max_1rm_delta
+      properties:
+        block_id:
+          type: string
+          readOnly: true
+          example: "blk-1001-0001"
+        block_volume_load:
+          type: number
+          format: double
+          readOnly: true
+          minimum: 0.0
+          description: Сумарний Volume Load робочих підходів виключно цього блоку (REQ-F-006, REQ-F-007)
+          example: 500.0
+        block_max_1rm:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          description: Максимальний розрахунковий 1RM серед робочих підходів блоку (REQ-F-011)
+          example: 116.66
+        has_previous_baseline:
+          type: boolean
+          readOnly: true
+          description: Чи існує попередній хронологічний запис цієї вправи для обчислення Дельти (REQ-F-018)
+          example: true
+        volume_load_delta:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          description: Різниця Volume Load відносно останнього хронологічного блоку цієї вправи (REQ-F-015)
+          example: 50.0
+        max_1rm_delta:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          description: Різниця максимального 1RM відносно останнього хронологічного блоку цієї вправи (REQ-F-016)
+          example: 2.5
+
+    ExerciseBlock:
+      type: object
+      description: Ізольований блок виконання вправи в межах сесії (REQ-F-006, RSK-09)
+      required:
+        - block_id
+        - session_id
+        - exercise_id
+        - exercise_name
+        - exercise_type
+        - rm_model
+        - order_index
+        - block_volume_load
+        - block_max_1rm
+        - has_previous_baseline
+        - volume_load_delta
+        - max_1rm_delta
+        - sets
+      properties:
+        block_id:
+          type: string
+          readOnly: true
+          example: "blk-1001-0001"
+        session_id:
+          type: string
+          readOnly: true
+          example: "ses-9001-2026-0915-000000000001"
+        exercise_id:
+          type: string
+          example: "ex-7701-4a2b-9c11-000000000001"
+        exercise_name:
+          type: string
+          readOnly: true
+          example: "Присідання зі штангою"
+        exercise_type:
+          $ref: '#/components/schemas/ExerciseType'
+        rm_model:
+          $ref: '#/components/schemas/RmModel'
+        order_index:
+          type: integer
+          minimum: 1
+          readOnly: true
+          description: Порядковий номер блоку в межах сесії (REQ-F-021)
+          example: 1
+        block_volume_load:
+          type: number
+          format: double
+          readOnly: true
+          minimum: 0.0
+          example: 500.0
+        block_max_1rm:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 116.66
+        has_previous_baseline:
+          type: boolean
+          readOnly: true
+          example: true
+        volume_load_delta:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 50.0
+        max_1rm_delta:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 2.5
+        sets:
+          type: array
+          readOnly: true
+          items:
+            $ref: '#/components/schemas/WorkoutSet'
+
+    CreateWorkoutSetRequest:
+      type: object
+      description: Вхідні дані для фіксації підходу (REQ-F-004, REQ-F-005, REQ-F-010)
+      required:
+        - weight
+        - reps
+        - rpe
+      properties:
+        weight:
+          type: number
+          format: double
+          description: |
+            Вага обтяження у кг:
+            - для `STANDARD`: `weight > 0`
+            - для `BODYWEIGHT`: `weight >= 0`
+            - для `ASSISTED`: `weight <= 0` (де `body_weight_snapshot + weight > 0`)
+          example: 100.0
+        reps:
+          type: integer
+          minimum: 1
+          maximum: 36
+          description: Кількість виконаних повторень (від 1 до 36 включно, REQ-F-004, RSK-02)
+          example: 5
+        rpe:
+          type: number
+          format: double
+          minimum: 6.0
+          maximum: 10.0
+          description: Суб'єктивна оцінка важкості підходу за шкалою RPE від 6.0 до 10.0 (REQ-F-004)
+          example: 8.5
+        is_warmup:
+          type: boolean
+          default: false
+          description: Прапорець розминочного підходу (REQ-F-005). Якщо true, підхід ігнорується у Volume Load та 1RM.
+          example: false
+
+    WorkoutSet:
+      type: object
+      description: Зафіксований підхід разом з обчисленими сервером метриками Volume Load та 1RM
+      required:
+        - set_id
+        - block_id
+        - set_number
+        - weight
+        - effective_weight
+        - reps
+        - rpe
+        - is_warmup
+        - set_volume_load
+        - estimated_1rm
+        - soft_constraint_warning
+      properties:
+        set_id:
+          type: string
+          readOnly: true
+          example: "set-5002"
+        block_id:
+          type: string
+          readOnly: true
+          example: "blk-1001-0001"
+        set_number:
+          type: integer
+          minimum: 1
+          readOnly: true
+          example: 2
+        weight:
+          type: number
+          format: double
+          example: 100.0
+        effective_weight:
+          type: number
+          format: double
+          readOnly: true
+          description: Фактичне розрахункове навантаження W_eff (REQ-F-021)
+          example: 100.0
+        reps:
+          type: integer
+          minimum: 1
+          maximum: 36
+          example: 5
+        rpe:
+          type: number
+          format: double
+          minimum: 6.0
+          maximum: 10.0
+          example: 8.5
+        is_warmup:
+          type: boolean
+          example: false
+        set_volume_load:
+          type: number
+          format: double
+          readOnly: true
+          minimum: 0.0
+          description: Обчислений тоннаж підходу (0.0 для розминочних підходів, REQ-F-006 – REQ-F-009)
+          example: 500.0
+        estimated_1rm:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          description: Розрахунковий одноповторний максимум (null для розминочних підходів, REQ-F-011, BDD-006)
+          example: 116.66
+        soft_constraint_warning:
+          type: boolean
+          readOnly: true
+          description: Індикатор зниженої точності розрахунку 1RM при кількості повторень > 10 (REQ-F-014, BDD-004)
+          example: false
+        warning_message:
+          type: string
+          readOnly: true
+          nullable: true
+          description: Текстове пояснення попередження Soft Constraint
+          example: null
+
+    CreateWorkoutSetResponse:
+      type: object
+      description: Відповідь при збереженні підходу з миттєвим оновленням агрегатів блоку (REQ-NF-001)
+      required:
+        - set
+        - block_summary
+      properties:
+        set:
+          $ref: '#/components/schemas/WorkoutSet'
+        block_summary:
+          $ref: '#/components/schemas/ExerciseBlockSummary'
+
+    DeleteWorkoutSetResponse:
+      type: object
+      description: Відповідь після видалення підходу з перерахованим станом блоку
+      required:
+        - deleted_set_id
+        - block_summary
+      properties:
+        deleted_set_id:
+          type: string
+          readOnly: true
+          example: "set-5004"
+        block_summary:
+          $ref: '#/components/schemas/ExerciseBlockSummary'
+
+    LatestProgressionSummary:
+      type: object
+      description: Підсумковий блок Дельти прогресії для останнього виконання вправи (REQ-F-015, REQ-F-016, REQ-F-018, BDD-005)
+      required:
+        - has_previous_baseline
+        - current_block_id
+        - previous_block_id
+        - current_volume_load
+        - previous_volume_load
+        - volume_load_delta
+        - current_max_1rm
+        - previous_max_1rm
+        - max_1rm_delta
+      properties:
+        has_previous_baseline:
+          type: boolean
+          readOnly: true
+          example: true
+        current_block_id:
+          type: string
+          readOnly: true
+          nullable: true
+          example: "blk-3003"
+        previous_block_id:
+          type: string
+          readOnly: true
+          nullable: true
+          example: "blk-2002"
+        current_volume_load:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 3300.0
+        previous_volume_load:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 3200.0
+        volume_load_delta:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 100.0
+        current_max_1rm:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 195.0
+        previous_max_1rm:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 190.0
+        max_1rm_delta:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 5.0
+
+    AnalyticsDataPoint:
+      type: object
+      description: Точка часового ряду для побудови лінійного графіка на дашборді (REQ-F-017, BDD-007)
+      required:
+        - session_id
+        - block_id
+        - performed_at
+        - body_weight_snapshot
+        - block_volume_load
+        - block_max_1rm
+        - volume_load_delta
+        - max_1rm_delta
+      properties:
+        session_id:
+          type: string
+          readOnly: true
+          example: "ses-03"
+        block_id:
+          type: string
+          readOnly: true
+          example: "blk-3003"
+        performed_at:
+          type: string
+          format: date-time
+          readOnly: true
+          example: "2026-09-15T18:00:00Z"
+        body_weight_snapshot:
+          type: number
+          format: double
+          readOnly: true
+          example: 80.0
+        block_volume_load:
+          type: number
+          format: double
+          readOnly: true
+          example: 3300.0
+        block_max_1rm:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 195.0
+        volume_load_delta:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 100.0
+        max_1rm_delta:
+          type: number
+          format: double
+          readOnly: true
+          nullable: true
+          example: 5.0
+
+    ExerciseAnalyticsResponse:
+      type: object
+      description: Дані візуального аналітичного дашборду вправи (REQ-F-015 – REQ-F-018, BDD-005, BDD-007)
+      required:
+        - exercise_id
+        - exercise_name
+        - exercise_type
+        - rm_model
+        - latest_progression
+        - data_points
+      properties:
+        exercise_id:
+          type: string
+          readOnly: true
+          example: "ex-7701-4a2b-9c11-000000000003"
+        exercise_name:
+          type: string
+          readOnly: true
+          example: "Станова тяга"
+        exercise_type:
+          $ref: '#/components/schemas/ExerciseType'
+        rm_model:
+          $ref: '#/components/schemas/RmModel'
+        latest_progression:
+          $ref: '#/components/schemas/LatestProgressionSummary'
+        data_points:
+          type: array
+          readOnly: true
+          items:
+            $ref: '#/components/schemas/AnalyticsDataPoint'
+
+    ErrorResponse:
+      type: object
+      description: Єдиний конверт помилки REST API (400, 404, 422)
+      required:
+        - error
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorObject'
+
+    ErrorObject:
+      type: object
+      description: Структурований опис помилки для автоматизованої верифікації (REQ-NF-009, REQ-NF-010)
+      required:
+        - code
+        - http_status
+        - message
+        - trace_id
+      properties:
+        code:
+          type: string
+          description: Машиночитаний код помилки
+          enum:
+            - ERR_BAD_REQUEST
+            - ERR_RESOURCE_NOT_FOUND
+            - ERR_RPE_OUT_OF_RANGE
+            - ERR_INVALID_REPS_COUNT
+            - ERR_BRZYCKI_MATHEMATICAL_LIMIT
+            - ERR_NEGATIVE_WEIGHT_NOT_ALLOWED
+            - ERR_POSITIVE_WEIGHT_IN_ASSISTED
+            - ERR_NON_POSITIVE_EFFECTIVE_LOAD
+            - ERR_INVALID_BODY_WEIGHT
+            - ERR_PROFILE_WEIGHT_MISSING
+            - ERR_DUPLICATE_EXERCISE_NAME
+          example: "ERR_RPE_OUT_OF_RANGE"
+        http_status:
+          type: integer
+          enum:
+            - 400
+            - 404
+            - 422
+          example: 422
+        message:
+          type: string
+          description: Людиночитане повідомлення про причину помилки
+          example: "Показник RPE повинен знаходитися в діапазоні від 6.0 до 10.0 згідно з REQ-F-004."
+        details:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Додатковий контекст помилки (назва поля, відхилене значення, допустимі межі)
+          example:
+            field: "rpe"
+            rejected_value: 5.5
+            allowed_min: 6.0
+            allowed_max: 10.0
+        trace_id:
+          type: string
+          description: Ідентифікатор трасування контрольної точки (REQ-NF-009)
+          example: "trc-9f8b7a6c-2026"
