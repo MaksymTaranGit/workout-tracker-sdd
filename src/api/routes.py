@@ -1,10 +1,10 @@
 """
 Маршрутизатор REST API (`/api/v1`) із оголошенням усіх 14 операцій зі `spec/openapi.yaml`.
 
-ВАЖЛИВО (SDD / TDD Red Phase Skeleton):
-Усі 14 ендпоінтів оголошено згідно з контрактом, але кожен повертає `501 Not Implemented`
-із обов'язковим записом виклику заглушки в `logs/system-execution.log` на рівні `TRACE`.
-Бізнес-логіка буде реалізована виключно після створення тестів та проходження `TEST-GATE`.
+У межах Етапу 1 (Блок 1: `TKT-02`, `TKT-04`) підключено 12 операцій профілю, каталогу вправ,
+тренувальних сесій, ізольованих блоків вправ та підходів через `WorkoutService`.
+Ендпоінти Блоків 3-4 (`PATCH /exercises/{exerciseId}` та `GET /exercises/{exerciseId}/analytics`)
+залишаються у фазі RED (`501 Not Implemented`).
 """
 
 from __future__ import annotations
@@ -36,8 +36,41 @@ from src.domain.schemas import (
     UserProfile,
     WorkoutSession,
 )
+from src.repositories.workout_repository import WorkoutRepository
+from src.services.workout_service import WorkoutService
 
 router = APIRouter(prefix="/api/v1")
+
+
+def get_workout_service(
+    db: sqlite3.Connection = Depends(get_db),
+) -> WorkoutService:
+    """Фабрика залежності `WorkoutService` із ініціалізованою БД SQLite."""
+    return WorkoutService(WorkoutRepository(db))
+
+
+def _log_api_operation(
+    request: Request,
+    operation_id: str,
+    context: dict[str, Any] | None = None,
+) -> str:
+    """Логує вхід в операцію API на рівні TRACE та повертає `trace_id`."""
+    trace_id = getattr(request.state, "trace_id", None) or get_trace_id()
+    log_context = {
+        "method": request.method,
+        "path": request.url.path,
+        "operation_id": operation_id,
+        **(context or {}),
+    }
+    log_event(
+        TRACE_LEVEL_NUM,
+        "API",
+        operation_id,
+        f"Invoking API operation '{operation_id}'",
+        context=log_context,
+        trace_id=trace_id,
+    )
+    return trace_id
 
 
 def _not_implemented_stub(
@@ -84,9 +117,10 @@ def _not_implemented_stub(
 )
 def get_user_profile(
     request: Request,
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(request, "getUserProfile")
+    service: WorkoutService = Depends(get_workout_service),
+) -> UserProfile:
+    _log_api_operation(request, "getUserProfile")
+    return service.get_user_profile()
 
 
 @router.put(
@@ -99,13 +133,14 @@ def get_user_profile(
 def update_user_profile(
     request: Request,
     payload: UpdateUserProfileRequest,
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> UserProfile:
+    _log_api_operation(
         request,
         "updateUserProfile",
         context={"payload": payload.model_dump(mode="json")},
     )
+    return service.update_user_profile(payload)
 
 
 # =====================================================================
@@ -124,13 +159,14 @@ def update_user_profile(
 def create_exercise(
     request: Request,
     payload: CreateExerciseRequest,
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> Exercise:
+    _log_api_operation(
         request,
         "createExercise",
         context={"payload": payload.model_dump(mode="json")},
     )
+    return service.create_exercise(payload)
 
 
 @router.get(
@@ -146,13 +182,14 @@ def list_exercises(
         default=None,
         description="Фільтр за біомеханічним типом вправи",
     ),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> ExerciseListResponse:
+    _log_api_operation(
         request,
         "listExercises",
         context={"exercise_type": exercise_type.value if exercise_type else None},
     )
+    return service.list_exercises(exercise_type=exercise_type)
 
 
 @router.get(
@@ -165,13 +202,14 @@ def list_exercises(
 def get_exercise_by_id(
     request: Request,
     exercise_id: str = Path(..., alias="exerciseId", min_length=1),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> Exercise:
+    _log_api_operation(
         request,
         "getExerciseById",
         context={"exerciseId": exercise_id},
     )
+    return service.get_exercise_by_id(exercise_id)
 
 
 @router.patch(
@@ -213,13 +251,14 @@ def update_exercise_model(
 def create_session(
     request: Request,
     payload: CreateSessionRequest | None = Body(default=None),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> WorkoutSession:
+    _log_api_operation(
         request,
         "createSession",
         context={"payload": payload.model_dump(mode="json") if payload else {}},
     )
+    return service.create_session(payload)
 
 
 @router.get(
@@ -233,13 +272,14 @@ def list_sessions(
     request: Request,
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> SessionListResponse:
+    _log_api_operation(
         request,
         "listSessions",
         context={"limit": limit, "offset": offset},
     )
+    return service.list_sessions(limit=limit, offset=offset)
 
 
 @router.get(
@@ -252,13 +292,14 @@ def list_sessions(
 def get_session_by_id(
     request: Request,
     session_id: str = Path(..., alias="sessionId", min_length=1),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> WorkoutSession:
+    _log_api_operation(
         request,
         "getSessionById",
         context={"sessionId": session_id},
     )
+    return service.get_session_by_id(session_id)
 
 
 # =====================================================================
@@ -278,9 +319,9 @@ def create_exercise_block(
     request: Request,
     payload: CreateExerciseBlockRequest,
     session_id: str = Path(..., alias="sessionId", min_length=1),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> ExerciseBlock:
+    _log_api_operation(
         request,
         "createExerciseBlock",
         context={
@@ -288,6 +329,7 @@ def create_exercise_block(
             "payload": payload.model_dump(mode="json"),
         },
     )
+    return service.create_exercise_block(session_id, payload)
 
 
 @router.get(
@@ -301,13 +343,14 @@ def get_exercise_block_by_id(
     request: Request,
     session_id: str = Path(..., alias="sessionId", min_length=1),
     block_id: str = Path(..., alias="blockId", min_length=1),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> ExerciseBlock:
+    _log_api_operation(
         request,
         "getExerciseBlockById",
         context={"sessionId": session_id, "blockId": block_id},
     )
+    return service.get_exercise_block_by_id(session_id, block_id)
 
 
 # =====================================================================
@@ -328,9 +371,9 @@ def create_workout_set(
     payload: CreateWorkoutSetRequest,
     session_id: str = Path(..., alias="sessionId", min_length=1),
     block_id: str = Path(..., alias="blockId", min_length=1),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> CreateWorkoutSetResponse:
+    _log_api_operation(
         request,
         "createWorkoutSet",
         context={
@@ -339,6 +382,7 @@ def create_workout_set(
             "payload": payload.model_dump(mode="json"),
         },
     )
+    return service.create_workout_set(session_id, block_id, payload)
 
 
 @router.delete(
@@ -353,13 +397,14 @@ def delete_workout_set(
     session_id: str = Path(..., alias="sessionId", min_length=1),
     block_id: str = Path(..., alias="blockId", min_length=1),
     set_id: str = Path(..., alias="setId", min_length=1),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> DeleteWorkoutSetResponse:
+    _log_api_operation(
         request,
         "deleteWorkoutSet",
         context={"sessionId": session_id, "blockId": block_id, "setId": set_id},
     )
+    return service.delete_workout_set(session_id, block_id, set_id)
 
 
 # =====================================================================
