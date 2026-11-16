@@ -1,13 +1,12 @@
 """
 Математичний рушій (Math Engine) системи.
 
-Реалізує розрахунки Етапів 2-3 (`TKT-09`, `TKT-11`, `TKT-16`, `TKT-18`):
+Реалізує розрахунки всіх чотирьох етапів SDD/TDD:
 - Ефективна вага $W_{eff}$ для `STANDARD`, `BODYWEIGHT` та `ASSISTED` (`REQ-F-008` – `REQ-F-010`, `REQ-F-021`);
 - Механічна робота підходу `Volume Load` з виключенням розминки (`REQ-F-006`, `REQ-F-007`, `BDD-003`);
 - Розрахунок одноповторного максимуму `1RM` за моделями `EPLEY` і `BRZYCKI` з високоточною
-  арифметикою `Decimal` (`ROUND_DOWN`) та попередженням Soft Constraint (`REQ-F-011` – `REQ-F-014`, `RSK-01`, `RSK-02`).
-
-Метод Блоку 4 (`calculate_deltas`) залишається у фазі RED (`NotImplementedError`).
+  арифметикою `Decimal` (`ROUND_DOWN`) та попередженням Soft Constraint (`REQ-F-011` – `REQ-F-014`, `RSK-01`, `RSK-02`);
+- Обчислення Дельти прогресії відносно останнього хронологічного блоку (`REQ-F-015`, `REQ-F-016`, `REQ-F-018`).
 """
 
 from __future__ import annotations
@@ -139,4 +138,56 @@ class MathEngine:
         previous_volume: float | None,
         previous_max_1rm: float | None,
     ) -> tuple[bool, float | None, float | None]:
-        raise NotImplementedError("TDD Red Phase: math engine method not implemented")
+        """
+        Обчислює Дельту Volume Load та 1RM відносно попереднього хронологічного виконання
+        з точністю `Decimal` без похибок IEEE 754 `float` (`REQ-F-015`, `REQ-F-016`, `REQ-F-018`).
+        """
+        if previous_volume is None or current_max_1rm is None:
+            log_event(
+                TRACE_LEVEL_NUM,
+                "MATH_ENGINE",
+                "calculate_deltas",
+                "Skipped delta calculation without baseline or working sets",
+                context={
+                    "current_volume": float(current_volume),
+                    "current_max_1rm": current_max_1rm,
+                    "previous_volume": previous_volume,
+                    "previous_max_1rm": previous_max_1rm,
+                    "has_previous_baseline": False,
+                },
+            )
+            return False, None, None
+
+        volume_delta = float(
+            (Decimal(str(current_volume)) - Decimal(str(previous_volume))).quantize(
+                Decimal("0.01")
+            )
+        )
+        max_1rm_delta = (
+            float(
+                (Decimal(str(current_max_1rm)) - Decimal(str(previous_max_1rm))).quantize(
+                    Decimal("0.01")
+                )
+            )
+            if previous_max_1rm is not None
+            else None
+        )
+
+        log_event(
+            TRACE_LEVEL_NUM,
+            "MATH_ENGINE",
+            "calculate_deltas",
+            "Calculated progression deltas",
+            context={
+                "current_volume": float(current_volume),
+                "previous_volume": float(previous_volume),
+                "volume_load_delta": volume_delta,
+                "current_max_1rm": float(current_max_1rm),
+                "previous_max_1rm": float(previous_max_1rm)
+                if previous_max_1rm is not None
+                else None,
+                "max_1rm_delta": max_1rm_delta,
+                "has_previous_baseline": True,
+            },
+        )
+        return True, volume_delta, max_1rm_delta

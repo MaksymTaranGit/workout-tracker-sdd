@@ -1,10 +1,9 @@
 """
 Шар доступу до даних (Repository Layer) для SQLite.
 
-Реалізує операції Блоку 1 (`TKT-02`, `TKT-04`): ініціалізацію схеми БД,
-управління профілем користувача, каталогом вправ, тренувальними сесіями,
-ізольованими блоками вправ та підходами.
-Методи Блоків 3-4 залишаються у фазі RED (`NotImplementedError`).
+Повністю реалізує операції всіх чотирьох блоків SDD/TDD: ініціалізацію схеми БД,
+управління профілем користувача, каталогом вправ (включно з оновленням `rm_model`),
+тренувальними сесіями, ізольованими блоками вправ, підходами та хронологічною вибіркою аналітики.
 """
 
 from __future__ import annotations
@@ -575,5 +574,59 @@ class WorkoutRepository:
         self.conn.commit()
         return _row_to_set(existing_row)
 
-    def get_exercise_analytics(self, exercise_id: str) -> dict[str, Any]:
-        raise NotImplementedError("TDD Red Phase: repository method not implemented")
+    def get_exercise_analytics(self, exercise_id: str) -> list[dict[str, Any]]:
+        """
+        Повертає всі блоки вправи з щонайменше одним робочим підходом (`is_warmup = 0`)
+        у суворому хронологічному порядку `(started_at ASC, order_index ASC, rowid ASC)`.
+        """
+        block_rows = self.conn.execute(
+            """
+            SELECT
+                eb.block_id,
+                eb.session_id,
+                eb.exercise_id,
+                eb.order_index,
+                eb.created_at,
+                e.name AS exercise_name,
+                e.exercise_type,
+                e.rm_model,
+                ws_ses.started_at,
+                ws_ses.body_weight_snapshot
+            FROM exercise_blocks eb
+            INNER JOIN exercises e ON e.exercise_id = eb.exercise_id
+            INNER JOIN workout_sessions ws_ses ON ws_ses.session_id = eb.session_id
+            WHERE eb.exercise_id = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM workout_sets ws
+                  WHERE ws.block_id = eb.block_id AND ws.is_warmup = 0
+              )
+            ORDER BY ws_ses.started_at ASC, eb.order_index ASC, eb.rowid ASC;
+            """,
+            (exercise_id,),
+        ).fetchall()
+
+        if not block_rows:
+            return []
+
+        set_rows = self.conn.execute(
+            """
+            SELECT ws.set_id, ws.block_id, ws.set_number, ws.weight, ws.reps, ws.rpe, ws.is_warmup, ws.created_at
+            FROM workout_sets ws
+            INNER JOIN exercise_blocks eb ON eb.block_id = ws.block_id
+            WHERE eb.exercise_id = ?
+            ORDER BY ws.set_number ASC, ws.rowid ASC;
+            """,
+            (exercise_id,),
+        ).fetchall()
+
+        sets_by_block: dict[str, list[dict[str, Any]]] = {}
+        for set_row in set_rows:
+            sets_by_block.setdefault(set_row["block_id"], []).append(_row_to_set(set_row))
+
+        result: list[dict[str, Any]] = []
+        for b_row in block_rows:
+            block_dict = _row_to_block(b_row, sets_by_block.get(b_row["block_id"], []))
+            block_dict["started_at"] = b_row["started_at"]
+            result.append(block_dict)
+        return result

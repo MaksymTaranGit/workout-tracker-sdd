@@ -1,10 +1,5 @@
 """
-Маршрутизатор REST API (`/api/v1`) із оголошенням усіх 14 операцій зі `spec/openapi.yaml`.
-
-У межах Етапу 1 (Блок 1: `TKT-02`, `TKT-04`) підключено 12 операцій профілю, каталогу вправ,
-тренувальних сесій, ізольованих блоків вправ та підходів через `WorkoutService`.
-Ендпоінти Блоків 3-4 (`PATCH /exercises/{exerciseId}` та `GET /exercises/{exerciseId}/analytics`)
-залишаються у фазі RED (`501 Not Implemented`).
+Маршрутизатор REST API (`/api/v1`) із оголошенням і повною реалізацією всіх 14 операцій зі `spec/openapi.yaml`.
 """
 
 from __future__ import annotations
@@ -13,10 +8,8 @@ import sqlite3
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Path, Query, Request
-from fastapi.responses import JSONResponse
 
 from src.core.database import get_db
-from src.core.errors import ErrorCode, build_error_response
 from src.core.logger import TRACE_LEVEL_NUM, get_trace_id, log_event
 from src.domain.schemas import (
     CreateExerciseBlockRequest,
@@ -71,36 +64,6 @@ def _log_api_operation(
         trace_id=trace_id,
     )
     return trace_id
-
-
-def _not_implemented_stub(
-    request: Request,
-    operation_id: str,
-    context: dict[str, Any] | None = None,
-) -> JSONResponse:
-    """Логує виклик TDD-заглушки на рівні TRACE та повертає HTTP 501 Not Implemented."""
-    trace_id = getattr(request.state, "trace_id", None) or get_trace_id()
-    log_context = {
-        "method": request.method,
-        "path": request.url.path,
-        "operation_id": operation_id,
-        **(context or {}),
-    }
-    log_event(
-        TRACE_LEVEL_NUM,
-        "API",
-        operation_id,
-        f"Stub endpoint '{operation_id}' invoked -> returning 501 Not Implemented (TDD Red Phase)",
-        context=log_context,
-        trace_id=trace_id,
-    )
-    return build_error_response(
-        code=ErrorCode.ERR_NOT_IMPLEMENTED,
-        http_status=501,
-        message=f"Операція '{operation_id}' ще не реалізована (TDD Red Phase Skeleton).",
-        details=log_context,
-        trace_id=trace_id,
-    )
 
 
 # =====================================================================
@@ -423,10 +386,35 @@ def delete_workout_set(
 def get_exercise_analytics(
     request: Request,
     exercise_id: str = Path(..., alias="exerciseId", min_length=1),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    from_date: str | None = Query(
+        default=None,
+        description="Початкова дата вибірки (ISO 8601, наприклад YYYY-MM-DD)",
+    ),
+    to_date: str | None = Query(
+        default=None,
+        description="Кінцева дата вибірки (ISO 8601, наприклад YYYY-MM-DD)",
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="Максимальна кількість історичних точок для графіка",
+    ),
+    service: WorkoutService = Depends(get_workout_service),
+) -> ExerciseAnalyticsResponse:
+    _log_api_operation(
         request,
         "getExerciseAnalytics",
-        context={"exerciseId": exercise_id},
+        context={
+            "exerciseId": exercise_id,
+            "from_date": from_date,
+            "to_date": to_date,
+            "limit": limit,
+        },
+    )
+    return service.get_exercise_analytics(
+        exercise_id=exercise_id,
+        from_date=from_date,
+        to_date=to_date,
+        limit=limit,
     )
