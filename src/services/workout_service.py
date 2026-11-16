@@ -1,19 +1,14 @@
 """
-Сервісний шар (Service Layer) для координації репозиторіїв, доменної валідації та телеметрії.
+Сервісний шар (Service Layer) для координації репозиторіїв, доменних валідаторів,
+математичного ядра та наскрізної телеметрії.
 
-Реалізує бізнес-логіку та доменні правила всіх чотирьох блоків SDD/TDD:
-- управління профілем користувача та обмеженням маси тіла `[30.0, 300.0]` (`REQ-F-019`, `AC10`);
-- управління каталогом вправ, унікальністю назв та вибором моделі 1RM (`REQ-F-012`, `REQ-F-013`, `REQ-F-020`, `AC11`);
-- створення сесій із незмінним знімком `body_weight_snapshot` (`REQ-F-001`, `REQ-F-002`, `BDD-001`, `RSK-06`);
-- управління ізольованими блоками вправ (`REQ-F-003`, `RSK-09`);
-- запис і видалення підходів із валідацією RPE, повторень та знака ваги (`REQ-F-004`, `REQ-F-005`, `AC2`, `RSK-02`, `RSK-07`);
-- обчислення `Volume Load`, `1RM`, Дельти прогресії відносно останньої бази та аналітика дашборду (`REQ-F-006` – `REQ-F-018`, `REQ-F-021`).
+Доменні обмеження та перевірки (`validate_body_weight`, `validate_workout_set_inputs`,
+`parse_and_validate_date_range`) ізольовані у модулі `src/domain/validators.py` (SRP).
 """
 
 from __future__ import annotations
 
-import math
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 from src.core.errors import AppError, ErrorCode
@@ -42,14 +37,29 @@ from src.domain.schemas import (
     WorkoutSessionSummary,
     WorkoutSet,
 )
+from src.domain.validators import (
+    parse_and_validate_date_range,
+    validate_body_weight,
+    validate_workout_set_inputs,
+)
 from src.repositories.workout_repository import WorkoutRepository
 from src.services.math_engine import MathEngine
 
-MIN_BODY_WEIGHT_KG = 30.0
-MAX_BODY_WEIGHT_KG = 300.0
-MIN_RPE = 6.0
-MAX_RPE = 10.0
-MAX_BRZYCKI_REPS = 36
+
+def _require_resource(
+    row: dict[str, Any] | None,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Гарантує існування запису ресурсу, інакше піднімає `404 ERR_RESOURCE_NOT_FOUND`."""
+    if row is None:
+        raise AppError(
+            ErrorCode.ERR_RESOURCE_NOT_FOUND,
+            404,
+            message,
+            details=details,
+        )
+    return row
 
 
 def _to_exercise_dto(row: dict[str, Any]) -> Exercise:
@@ -69,7 +79,7 @@ def _to_workout_set_dto(
     body_weight_snapshot: float,
     rm_model: str = "EPLEY",
 ) -> WorkoutSet:
-    """Формує DTO підходу з обчисленням W_eff, set_volume_load (Блок 2) та 1RM (Блок 3)."""
+    """Формує DTO підходу з обчисленням W_eff, set_volume_load та 1RM."""
     weight = float(row["weight"])
     reps = int(row["reps"])
     is_warmup = bool(row["is_warmup"])
@@ -120,74 +130,14 @@ def _compute_block_sets_and_metrics(
     return sets, block_volume_load, block_max_1rm
 
 
-def _parse_iso_date(raw_date: str, param_name: str) -> date:
-    """Валідує рядок дати ISO-8601 (`YYYY-MM-DD` або datetime) і повертає `date` або `400 ERR_BAD_REQUEST`."""
-    try:
-        if len(raw_date) == 10:
-            return date.fromisoformat(raw_date)
-        return datetime.fromisoformat(raw_date.replace("Z", "+00:00")).date()
-    except ValueError as exc:
-        raise AppError(
-            ErrorCode.ERR_BAD_REQUEST,
-            400,
-            f"Некоректний формат дати в параметрі '{param_name}'. Очікується ISO-8601 (YYYY-MM-DD).",
-            details={"field": param_name, "value": raw_date},
-        ) from exc
-
-
-def _validate_set_weight(
-    exercise_type: str, weight: float, body_weight_snapshot: float
-) -> None:
-    """Перевіряє знак ваги та умову позитивного навантаження (RSK-07, 422)."""
-    if not math.isfinite(weight):
-        raise AppError(
-            ErrorCode.ERR_BAD_REQUEST,
-            400,
-            "Некоректне числове значення ваги.",
-            details={"field": "weight", "value": str(weight)},
-        )
-
-    if exercise_type == ExerciseType.STANDARD.value and weight <= 0.0:
-        raise AppError(
-            ErrorCode.ERR_NEGATIVE_WEIGHT_NOT_ALLOWED,
-            422,
-            "Для вправи типу STANDARD вага обтяження повинна бути строго додатною (> 0 кг).",
-            details={"field": "weight", "exercise_type": exercise_type, "value": weight},
-        )
-
-    if exercise_type == ExerciseType.BODYWEIGHT.value and weight < 0.0:
-        raise AppError(
-            ErrorCode.ERR_NEGATIVE_WEIGHT_NOT_ALLOWED,
-            422,
-            "Для вправи типу BODYWEIGHT додаткова вага не може бути від'ємною (>= 0 кг).",
-            details={"field": "weight", "exercise_type": exercise_type, "value": weight},
-        )
-
-    if exercise_type == ExerciseType.ASSISTED.value:
-        if weight > 0.0:
-            raise AppError(
-                ErrorCode.ERR_POSITIVE_WEIGHT_IN_ASSISTED,
-                422,
-                "Для вправи з компенсацією (ASSISTED) значення weight має бути <= 0.",
-                details={"field": "weight", "exercise_type": exercise_type, "value": weight},
-            )
-        if body_weight_snapshot + weight <= 0.0:
-            raise AppError(
-                ErrorCode.ERR_NON_POSITIVE_EFFECTIVE_LOAD,
-                422,
-                "Величина компенсації не може перевищувати або дорівнювати масі тіла користувача (W_eff <= 0).",
-                details={
-                    "field": "weight",
-                    "exercise_type": exercise_type,
-                    "weight": weight,
-                    "body_weight_snapshot": body_weight_snapshot,
-                    "effective_weight": body_weight_snapshot + weight,
-                },
-            )
-
-
 class WorkoutService:
-    """Сервіс управління тренуваннями (Етап 1 / Блок 1)."""
+    """
+    Повний сервіс управління силовими тренуваннями та аналітикою прогресії (Етапи 1–4):
+    - профіль користувача, каталог вправ та вибір моделі 1RM;
+    - тренувальні сесії з незмінними знімками маси тіла та ізольовані блоки;
+    - логування підходів, розрахунок W_eff, Volume Load, 1RM (Epley/Brzycki) та Дельти;
+    - формування даних візуального дашборду прогресії.
+    """
 
     def __init__(self, repository: WorkoutRepository) -> None:
         self.repository = repository
@@ -200,36 +150,24 @@ class WorkoutService:
             "getUserProfile",
             "Fetching global user profile",
         )
-        profile = self.repository.get_profile()
-        if profile is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                "Профіль користувача не знайдено.",
-            )
+        profile = _require_resource(
+            self.repository.get_profile(),
+            "Профіль користувача не знайдено.",
+        )
         return UserProfile(**profile)
 
     def update_user_profile(self, payload: UpdateUserProfileRequest) -> UserProfile:
-        weight = payload.current_body_weight
         log_event(
             TRACE_LEVEL_NUM,
             "SERVICE",
             "updateUserProfile",
             "Validating and updating user body weight",
-            context={"current_body_weight": weight},
+            context={"current_body_weight": payload.current_body_weight},
         )
-        if not math.isfinite(weight) or weight < MIN_BODY_WEIGHT_KG or weight > MAX_BODY_WEIGHT_KG:
-            raise AppError(
-                ErrorCode.ERR_INVALID_BODY_WEIGHT,
-                422,
-                f"Маса тіла користувача повинна бути в діапазоні [{MIN_BODY_WEIGHT_KG}, {MAX_BODY_WEIGHT_KG}] кг.",
-                details={
-                    "field": "current_body_weight",
-                    "value": weight,
-                    "min": MIN_BODY_WEIGHT_KG,
-                    "max": MAX_BODY_WEIGHT_KG,
-                },
-            )
+        weight = validate_body_weight(
+            payload.current_body_weight,
+            error_code=ErrorCode.ERR_INVALID_BODY_WEIGHT,
+        )
         updated = self.repository.upsert_profile(weight)
         return UserProfile(**updated)
 
@@ -245,8 +183,7 @@ class WorkoutService:
                 "rm_model": payload.rm_model.value,
             },
         )
-        existing = self.repository.get_exercise_by_name(payload.name)
-        if existing is not None:
+        if self.repository.get_exercise_by_name(payload.name) is not None:
             raise AppError(
                 ErrorCode.ERR_DUPLICATE_EXERCISE_NAME,
                 422,
@@ -281,14 +218,11 @@ class WorkoutService:
             "Fetching exercise details",
             context={"exercise_id": exercise_id},
         )
-        row = self.repository.get_exercise_by_id(exercise_id)
-        if row is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                f"Вправу '{exercise_id}' не знайдено.",
-                details={"resource": "exercise", "exercise_id": exercise_id},
-            )
+        row = _require_resource(
+            self.repository.get_exercise_by_id(exercise_id),
+            f"Вправу '{exercise_id}' не знайдено.",
+            details={"resource": "exercise", "exercise_id": exercise_id},
+        )
         return _to_exercise_dto(row)
 
     def update_exercise_model(
@@ -304,17 +238,14 @@ class WorkoutService:
                 "rm_model": payload.rm_model.value,
             },
         )
-        updated = self.repository.update_exercise_model(
-            exercise_id=exercise_id,
-            rm_model=payload.rm_model.value,
+        updated = _require_resource(
+            self.repository.update_exercise_model(
+                exercise_id=exercise_id,
+                rm_model=payload.rm_model.value,
+            ),
+            f"Вправу '{exercise_id}' не знайдено.",
+            details={"resource": "exercise", "exercise_id": exercise_id},
         )
-        if updated is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                f"Вправу '{exercise_id}' не знайдено.",
-                details={"resource": "exercise", "exercise_id": exercise_id},
-            )
         return _to_exercise_dto(updated)
 
     def create_session(self, payload: CreateSessionRequest | None = None) -> WorkoutSession:
@@ -336,15 +267,10 @@ class WorkoutService:
                 "У профілі користувача відсутня поточна маса тіла для фіксації снапшота.",
             )
 
-        body_weight = float(profile["current_body_weight"])
-        if body_weight < MIN_BODY_WEIGHT_KG or body_weight > MAX_BODY_WEIGHT_KG:
-            raise AppError(
-                ErrorCode.ERR_PROFILE_WEIGHT_MISSING,
-                422,
-                "Поточна маса тіла в профілі некоректна або відсутня.",
-                details={"current_body_weight": body_weight},
-            )
-
+        body_weight = validate_body_weight(
+            float(profile["current_body_weight"]),
+            error_code=ErrorCode.ERR_PROFILE_WEIGHT_MISSING,
+        )
         created = self.repository.create_session(
             body_weight_snapshot=body_weight,
             started_at=payload.started_at if payload else None,
@@ -378,14 +304,11 @@ class WorkoutService:
             "Fetching full workout session details",
             context={"session_id": session_id},
         )
-        session = self.repository.get_session_by_id(session_id)
-        if session is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                f"Тренувальну сесію '{session_id}' не знайдено.",
-                details={"resource": "session", "session_id": session_id},
-            )
+        session = _require_resource(
+            self.repository.get_session_by_id(session_id),
+            f"Тренувальну сесію '{session_id}' не знайдено.",
+            details={"resource": "session", "session_id": session_id},
+        )
         working_blocks_cache: dict[str, list[dict[str, Any]]] = {}
         blocks = [
             self._assemble_exercise_block(b, working_blocks_cache=working_blocks_cache)
@@ -482,22 +405,16 @@ class WorkoutService:
             "Creating isolated exercise block in session",
             context={"session_id": session_id, "exercise_id": payload.exercise_id},
         )
-        session = self.repository.get_session_by_id(session_id)
-        if session is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                f"Тренувальну сесію '{session_id}' не знайдено.",
-                details={"resource": "session", "session_id": session_id},
-            )
-        exercise = self.repository.get_exercise_by_id(payload.exercise_id)
-        if exercise is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                f"Вправу '{payload.exercise_id}' не знайдено в каталозі.",
-                details={"resource": "exercise", "exercise_id": payload.exercise_id},
-            )
+        _require_resource(
+            self.repository.get_session_by_id(session_id),
+            f"Тренувальну сесію '{session_id}' не знайдено.",
+            details={"resource": "session", "session_id": session_id},
+        )
+        _require_resource(
+            self.repository.get_exercise_by_id(payload.exercise_id),
+            f"Вправу '{payload.exercise_id}' не знайдено в каталозі.",
+            details={"resource": "exercise", "exercise_id": payload.exercise_id},
+        )
         block = self.repository.create_exercise_block(session_id, payload.exercise_id)
         return self._assemble_exercise_block(block)
 
@@ -511,14 +428,11 @@ class WorkoutService:
             "Fetching isolated exercise block details",
             context={"session_id": session_id, "block_id": block_id},
         )
-        block = self.repository.get_exercise_block_by_id(session_id, block_id)
-        if block is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                f"Блок вправи '{block_id}' у сесії '{session_id}' не знайдено.",
-                details={"resource": "block", "session_id": session_id, "block_id": block_id},
-            )
+        block = _require_resource(
+            self.repository.get_exercise_block_by_id(session_id, block_id),
+            f"Блок вправи '{block_id}' у сесії '{session_id}' не знайдено.",
+            details={"resource": "block", "session_id": session_id, "block_id": block_id},
+        )
         return self._assemble_exercise_block(block)
 
     def create_workout_set(
@@ -538,51 +452,16 @@ class WorkoutService:
                 "is_warmup": payload.is_warmup,
             },
         )
-        block = self.repository.get_exercise_block_by_id(session_id, block_id)
-        if block is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                f"Блок вправи '{block_id}' у сесії '{session_id}' не знайдено.",
-                details={"resource": "block", "session_id": session_id, "block_id": block_id},
-            )
-
-        if not math.isfinite(payload.rpe) or payload.rpe < MIN_RPE or payload.rpe > MAX_RPE:
-            raise AppError(
-                ErrorCode.ERR_RPE_OUT_OF_RANGE,
-                422,
-                f"Показник RPE повинен бути в межах від {MIN_RPE} до {MAX_RPE}.",
-                details={
-                    "field": "rpe",
-                    "value": payload.rpe,
-                    "min": MIN_RPE,
-                    "max": MAX_RPE,
-                },
-            )
-
-        if payload.reps <= 0:
-            raise AppError(
-                ErrorCode.ERR_INVALID_REPS_COUNT,
-                422,
-                "Кількість повторень повинна бути більшою за 0.",
-                details={"field": "reps", "value": payload.reps, "min": 1},
-            )
-
-        if payload.reps > MAX_BRZYCKI_REPS:
-            raise AppError(
-                ErrorCode.ERR_BRZYCKI_MATHEMATICAL_LIMIT,
-                422,
-                f"Кількість повторень {payload.reps} перевищує математичне обмеження (<= {MAX_BRZYCKI_REPS}) формули Brzycki.",
-                details={
-                    "field": "reps",
-                    "value": payload.reps,
-                    "max": MAX_BRZYCKI_REPS,
-                },
-            )
-
-        _validate_set_weight(
+        block = _require_resource(
+            self.repository.get_exercise_block_by_id(session_id, block_id),
+            f"Блок вправи '{block_id}' у сесії '{session_id}' не знайдено.",
+            details={"resource": "block", "session_id": session_id, "block_id": block_id},
+        )
+        validate_workout_set_inputs(
             exercise_type=block["exercise_type"],
             weight=payload.weight,
+            reps=payload.reps,
+            rpe=payload.rpe,
             body_weight_snapshot=float(block["body_weight_snapshot"]),
         )
 
@@ -620,28 +499,21 @@ class WorkoutService:
                 "set_id": set_id,
             },
         )
-        block = self.repository.get_exercise_block_by_id(session_id, block_id)
-        if block is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                f"Блок вправи '{block_id}' у сесії '{session_id}' не знайдено.",
-                details={"resource": "block", "session_id": session_id, "block_id": block_id},
-            )
-
-        deleted_set = self.repository.delete_workout_set(session_id, block_id, set_id)
-        if deleted_set is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                f"Підхід '{set_id}' у блоці '{block_id}' не знайдено.",
-                details={
-                    "resource": "set",
-                    "session_id": session_id,
-                    "block_id": block_id,
-                    "set_id": set_id,
-                },
-            )
+        _require_resource(
+            self.repository.get_exercise_block_by_id(session_id, block_id),
+            f"Блок вправи '{block_id}' у сесії '{session_id}' не знайдено.",
+            details={"resource": "block", "session_id": session_id, "block_id": block_id},
+        )
+        deleted_set = _require_resource(
+            self.repository.delete_workout_set(session_id, block_id, set_id),
+            f"Підхід '{set_id}' у блоці '{block_id}' не знайдено.",
+            details={
+                "resource": "set",
+                "session_id": session_id,
+                "block_id": block_id,
+                "set_id": set_id,
+            },
+        )
 
         updated_block = self.repository.get_exercise_block_by_id(session_id, block_id)
         assert updated_block is not None
@@ -669,24 +541,12 @@ class WorkoutService:
                 "limit": limit,
             },
         )
-        exercise = self.repository.get_exercise_by_id(exercise_id)
-        if exercise is None:
-            raise AppError(
-                ErrorCode.ERR_RESOURCE_NOT_FOUND,
-                404,
-                f"Вправу '{exercise_id}' не знайдено.",
-                details={"resource": "exercise", "exercise_id": exercise_id},
-            )
-
-        parsed_from = _parse_iso_date(from_date, "from_date") if from_date is not None else None
-        parsed_to = _parse_iso_date(to_date, "to_date") if to_date is not None else None
-        if parsed_from is not None and parsed_to is not None and parsed_from > parsed_to:
-            raise AppError(
-                ErrorCode.ERR_BAD_REQUEST,
-                400,
-                "Початкова дата 'from_date' не може перевищувати кінцеву дату 'to_date'.",
-                details={"from_date": from_date, "to_date": to_date},
-            )
+        exercise = _require_resource(
+            self.repository.get_exercise_by_id(exercise_id),
+            f"Вправу '{exercise_id}' не знайдено.",
+            details={"resource": "exercise", "exercise_id": exercise_id},
+        )
+        parsed_from, parsed_to = parse_and_validate_date_range(from_date, to_date)
 
         working_blocks = self.repository.get_exercise_analytics(exercise_id)
 
