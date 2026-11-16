@@ -67,7 +67,16 @@ def _row_to_set(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _row_to_block(row: sqlite3.Row, sets: list[dict[str, Any]]) -> dict[str, Any]:
+def _row_to_block(
+    row: sqlite3.Row,
+    sets: list[dict[str, Any]],
+    body_weight_snapshot: float | None = None,
+) -> dict[str, Any]:
+    resolved_snapshot = (
+        float(body_weight_snapshot)
+        if body_weight_snapshot is not None
+        else float(row["body_weight_snapshot"])
+    )
     return {
         "block_id": row["block_id"],
         "session_id": row["session_id"],
@@ -76,6 +85,7 @@ def _row_to_block(row: sqlite3.Row, sets: list[dict[str, Any]]) -> dict[str, Any
         "exercise_type": row["exercise_type"],
         "rm_model": row["rm_model"],
         "order_index": int(row["order_index"]),
+        "body_weight_snapshot": resolved_snapshot,
         "created_at": row["created_at"],
         "sets": sets,
     }
@@ -408,14 +418,19 @@ class WorkoutRepository:
             for set_row in set_rows:
                 sets_by_block.setdefault(set_row["block_id"], []).append(_row_to_set(set_row))
 
+        snapshot = float(session_row["body_weight_snapshot"])
         blocks = [
-            _row_to_block(b_row, sets_by_block.get(b_row["block_id"], []))
+            _row_to_block(
+                b_row,
+                sets_by_block.get(b_row["block_id"], []),
+                body_weight_snapshot=snapshot,
+            )
             for b_row in block_rows
         ]
         return {
             "session_id": session_row["session_id"],
             "started_at": session_row["started_at"],
-            "body_weight_snapshot": float(session_row["body_weight_snapshot"]),
+            "body_weight_snapshot": snapshot,
             "notes": session_row["notes"],
             "blocks": blocks,
         }
@@ -459,9 +474,11 @@ class WorkoutRepository:
                 eb.created_at,
                 e.name AS exercise_name,
                 e.exercise_type,
-                e.rm_model
+                e.rm_model,
+                ws_ses.body_weight_snapshot
             FROM exercise_blocks eb
             INNER JOIN exercises e ON e.exercise_id = eb.exercise_id
+            INNER JOIN workout_sessions ws_ses ON ws_ses.session_id = eb.session_id
             WHERE eb.session_id = ? AND eb.block_id = ?;
             """,
             (session_id, block_id),
