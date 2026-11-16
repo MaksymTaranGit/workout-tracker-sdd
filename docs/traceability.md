@@ -1,6 +1,6 @@
 # Матриця простежуваності та розподілу відповідальності (Traceability & RACI Matrix)
 
-Цей документ забезпечує двосторонню простежуваність між функціональними вимогами (`REQ-F-001` – `REQ-F-021`), критеріями прийняття (`AC1` – `AC12`), BDD-сценаріями (`BDD-001` – `BDD-007`), робочими тікетами беклогу та операціями контракту REST API (`spec/openapi.yaml`), а також фіксує розподіл ролей між кодинговим агентом та людиною.
+Цей документ забезпечує двосторонню простежуваність між функціональними вимогами (`REQ-F-001` – `REQ-F-022`), критеріями прийняття (`AC1` – `AC13`), BDD-сценаріями (`BDD-001` – `BDD-008`), робочими тікетами беклогу та операціями контракту REST API (`spec/openapi.yaml`), а також фіксує розподіл ролей між кодинговим агентом та людиною.
 
 ---
 
@@ -43,3 +43,4 @@
 | **REQ-F-019** | Поточна маса тіла в профілі (30.0–300.0 кг) та незмінність історичних снапшотів (`spec/srs-addendum.md`) | AC10 | BDD-001 | TKT-02 | TKT-01 | `GET /api/v1/profile` (`getUserProfile`), `PUT /api/v1/profile` (`updateUserProfile`) |
 | **REQ-F-020** | Каталог вправ (`STANDARD`, `BODYWEIGHT`, `ASSISTED`) та налаштування 1RM (`spec/srs-addendum.md`) | AC11 | BDD-002, BDD-006 | TKT-06 (TKT-04, TKT-16) | TKT-03, TKT-15 | `POST /api/v1/exercises` (`createExercise`), `GET /api/v1/exercises` (`listExercises`), `GET /api/v1/exercises/{exerciseId}` (`getExerciseById`), `PATCH /api/v1/exercises/{exerciseId}` (`updateExerciseModel`) |
 | **REQ-F-021** | Ефективне обтяження $W_{eff}$ у 1RM та хронологічний порядок блоків для Дельти (`spec/srs-addendum.md`) | AC12 | BDD-002, BDD-005, BDD-006 | TKT-09, TKT-11, TKT-23 | TKT-03, TKT-08 | `POST /api/v1/sessions/{sessionId}/blocks/{blockId}/sets` (`createWorkoutSet`), `GET /api/v1/exercises/{exerciseId}/analytics` (`getExerciseAnalytics`) |
+| **REQ-F-022** | М'яке видалення (архівація) вправи з каталогу зі збереженням історичної цілісності (`spec/srs-addendum-2.md`) | AC13 | BDD-008 | TKT-30 | TKT-29 | `DELETE /api/v1/exercises/{exerciseId}` (`deleteExercise`), `GET /api/v1/exercises` (`listExercises`), `POST /api/v1/sessions/{sessionId}/blocks` (`createExerciseBlock`), `GET /api/v1/sessions/{sessionId}` (`getSessionById`), `GET /api/v1/exercises/{exerciseId}/analytics` (`getExerciseAnalytics`) |
