@@ -41,6 +41,7 @@ from src.domain.schemas import (
     WorkoutSet,
 )
 from src.repositories.workout_repository import WorkoutRepository
+from src.services.math_engine import MathEngine
 
 MIN_BODY_WEIGHT_KG = 30.0
 MAX_BODY_WEIGHT_KG = 300.0
@@ -60,30 +61,56 @@ def _to_exercise_dto(row: dict[str, Any]) -> Exercise:
     )
 
 
-def _to_workout_set_dto(row: dict[str, Any]) -> WorkoutSet:
-    """Формує DTO підходу з контрактними базовими полями метрик Блоків 2-4."""
+def _to_workout_set_dto(
+    row: dict[str, Any], exercise_type: str, body_weight_snapshot: float
+) -> WorkoutSet:
+    """Формує DTO підходу з обчисленням W_eff і set_volume_load (Блок 2)."""
     weight = float(row["weight"])
+    reps = int(row["reps"])
+    is_warmup = bool(row["is_warmup"])
+
+    effective_weight = MathEngine.calculate_effective_weight(
+        exercise_type, weight, body_weight_snapshot
+    )
+    set_volume_load = MathEngine.calculate_set_volume_load(
+        effective_weight, reps, is_warmup
+    )
     return WorkoutSet(
         set_id=row["set_id"],
         block_id=row["block_id"],
         set_number=int(row["set_number"]),
         weight=weight,
-        effective_weight=weight,
-        reps=int(row["reps"]),
+        effective_weight=effective_weight,
+        reps=reps,
         rpe=float(row["rpe"]),
-        is_warmup=bool(row["is_warmup"]),
-        set_volume_load=0.0,
+        is_warmup=is_warmup,
+        set_volume_load=set_volume_load,
         estimated_1rm=None,
         soft_constraint_warning=False,
         warning_message=None,
     )
 
 
-def _build_block_summary_dto(block_id: str) -> ExerciseBlockSummary:
-    """Повертає базове зведення блоку до реалізації Блоків 2-4."""
+def _compute_block_sets_and_volume(
+    row: dict[str, Any],
+) -> tuple[list[WorkoutSet], float]:
+    """Обчислює перелік підходів і сумарний Volume Load виключно для одного блоку."""
+    exercise_type = row["exercise_type"]
+    body_weight_snapshot = float(row["body_weight_snapshot"])
+    sets = [
+        _to_workout_set_dto(s, exercise_type, body_weight_snapshot)
+        for s in row.get("sets", [])
+    ]
+    block_volume_load = round(sum(s.set_volume_load for s in sets), 2)
+    return sets, block_volume_load
+
+
+def _build_block_summary_dto(block_row: dict[str, Any]) -> ExerciseBlockSummary:
+    """Повертає актуальне зведення блоку з розрахованим `block_volume_load`."""
+    _, block_volume_load = _compute_block_sets_and_volume(block_row)
     return ExerciseBlockSummary(
-        block_id=block_id,
-        block_volume_load=0.0,
+        block_id=block_row["block_id"],
+        block_volume_load=block_volume_load,
         block_max_1rm=None,
         has_previous_baseline=False,
         volume_load_delta=None,
@@ -92,7 +119,7 @@ def _build_block_summary_dto(block_id: str) -> ExerciseBlockSummary:
 
 
 def _to_exercise_block_dto(row: dict[str, Any]) -> ExerciseBlock:
-    sets = [_to_workout_set_dto(s) for s in row.get("sets", [])]
+    sets, block_volume_load = _compute_block_sets_and_volume(row)
     return ExerciseBlock(
         block_id=row["block_id"],
         session_id=row["session_id"],
@@ -101,13 +128,64 @@ def _to_exercise_block_dto(row: dict[str, Any]) -> ExerciseBlock:
         exercise_type=ExerciseType(row["exercise_type"]),
         rm_model=RmModel(row["rm_model"]),
         order_index=int(row["order_index"]),
-        block_volume_load=0.0,
+        block_volume_load=block_volume_load,
         block_max_1rm=None,
         has_previous_baseline=False,
         volume_load_delta=None,
         max_1rm_delta=None,
         sets=sets,
     )
+
+
+def _validate_set_weight(
+    exercise_type: str, weight: float, body_weight_snapshot: float
+) -> None:
+    """Перевіряє знак ваги та умову позитивного навантаження (RSK-07, 422)."""
+    if not math.isfinite(weight):
+        raise AppError(
+            ErrorCode.ERR_BAD_REQUEST,
+            400,
+            "Некоректне числове значення ваги.",
+            details={"field": "weight", "value": str(weight)},
+        )
+
+    if exercise_type == ExerciseType.STANDARD.value and weight <= 0.0:
+        raise AppError(
+            ErrorCode.ERR_NEGATIVE_WEIGHT_NOT_ALLOWED,
+            422,
+            "Для вправи типу STANDARD вага обтяження повинна бути строго додатною (> 0 кг).",
+            details={"field": "weight", "exercise_type": exercise_type, "value": weight},
+        )
+
+    if exercise_type == ExerciseType.BODYWEIGHT.value and weight < 0.0:
+        raise AppError(
+            ErrorCode.ERR_NEGATIVE_WEIGHT_NOT_ALLOWED,
+            422,
+            "Для вправи типу BODYWEIGHT додаткова вага не може бути від'ємною (>= 0 кг).",
+            details={"field": "weight", "exercise_type": exercise_type, "value": weight},
+        )
+
+    if exercise_type == ExerciseType.ASSISTED.value:
+        if weight > 0.0:
+            raise AppError(
+                ErrorCode.ERR_POSITIVE_WEIGHT_IN_ASSISTED,
+                422,
+                "Для вправи з компенсацією (ASSISTED) значення weight має бути <= 0.",
+                details={"field": "weight", "exercise_type": exercise_type, "value": weight},
+            )
+        if body_weight_snapshot + weight <= 0.0:
+            raise AppError(
+                ErrorCode.ERR_NON_POSITIVE_EFFECTIVE_LOAD,
+                422,
+                "Величина компенсації не може перевищувати або дорівнювати масі тіла користувача (W_eff <= 0).",
+                details={
+                    "field": "weight",
+                    "exercise_type": exercise_type,
+                    "weight": weight,
+                    "body_weight_snapshot": body_weight_snapshot,
+                    "effective_weight": body_weight_snapshot + weight,
+                },
+            )
 
 
 class WorkoutService:
@@ -406,6 +484,12 @@ class WorkoutService:
                 },
             )
 
+        _validate_set_weight(
+            exercise_type=block["exercise_type"],
+            weight=payload.weight,
+            body_weight_snapshot=float(block["body_weight_snapshot"]),
+        )
+
         created_set = self.repository.create_workout_set(
             session_id=session_id,
             block_id=block_id,
@@ -414,9 +498,15 @@ class WorkoutService:
             rpe=payload.rpe,
             is_warmup=payload.is_warmup,
         )
+        updated_block = self.repository.get_exercise_block_by_id(session_id, block_id)
+        assert updated_block is not None
         return CreateWorkoutSetResponse(
-            set=_to_workout_set_dto(created_set),
-            block_summary=_build_block_summary_dto(block_id),
+            set=_to_workout_set_dto(
+                created_set,
+                block["exercise_type"],
+                float(block["body_weight_snapshot"]),
+            ),
+            block_summary=_build_block_summary_dto(updated_block),
         )
 
     def delete_workout_set(
@@ -456,9 +546,11 @@ class WorkoutService:
                 },
             )
 
+        updated_block = self.repository.get_exercise_block_by_id(session_id, block_id)
+        assert updated_block is not None
         return DeleteWorkoutSetResponse(
             deleted_set_id=deleted_set["set_id"],
-            block_summary=_build_block_summary_dto(block_id),
+            block_summary=_build_block_summary_dto(updated_block),
         )
 
     def get_exercise_analytics(self, exercise_id: str) -> ExerciseAnalyticsResponse:
