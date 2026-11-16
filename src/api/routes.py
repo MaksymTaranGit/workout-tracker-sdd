@@ -12,6 +12,7 @@ from fastapi import APIRouter, Body, Depends, Path, Query, Request
 from src.core.database import get_db
 from src.core.logger import TRACE_LEVEL_NUM, get_trace_id, log_event
 from src.domain.schemas import (
+    ArchiveExerciseResponse,
     CreateExerciseBlockRequest,
     CreateExerciseRequest,
     CreateSessionRequest,
@@ -197,6 +198,26 @@ def update_exercise_model(
         },
     )
     return service.update_exercise_model(exercise_id, payload)
+
+
+@router.delete(
+    "/exercises/{exerciseId}",
+    operation_id="deleteExercise",
+    tags=["Exercises"],
+    response_model=ArchiveExerciseResponse,
+    summary="М'яке видалення (архівація) вправи з каталогу (REQ-F-022, BDD-008)",
+)
+def delete_exercise(
+    request: Request,
+    exercise_id: str = Path(..., alias="exerciseId", min_length=1),
+    service: WorkoutService = Depends(get_workout_service),
+) -> ArchiveExerciseResponse:
+    _log_api_operation(
+        request,
+        "deleteExercise",
+        context={"exerciseId": exercise_id},
+    )
+    return service.delete_exercise(exercise_id)
 
 
 # =====================================================================

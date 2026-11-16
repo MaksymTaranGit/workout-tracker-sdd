@@ -75,14 +75,25 @@ class UpdateExerciseModelRequest(BaseModel):
 
 
 class Exercise(BaseModel):
-    """Сутність вправи в довіднику (REQ-F-012, REQ-F-013, REQ-F-020)."""
+    """Сутність вправи в довіднику (REQ-F-012, REQ-F-013, REQ-F-020, REQ-F-022)."""
 
     exercise_id: str = Field(..., description="Унікальний ідентифікатор вправи")
     name: str = Field(..., min_length=2, max_length=120, description="Назва вправи")
     exercise_type: ExerciseType = Field(..., description="Біомеханічний тип вправи")
     rm_model: RmModel = Field(..., description="Активна математична модель 1RM")
+    is_archived: bool = Field(default=False, description="Прапорець м'якого видалення (архівації) вправи")
+    archived_at: str | None = Field(default=None, description="Час архівації вправи (ISO-8601 UTC)")
     created_at: str = Field(..., description="Час створення запису (ISO-8601 UTC)")
     updated_at: str | None = Field(default=None, description="Час останнього оновлення (ISO-8601 UTC)")
+
+
+class ArchiveExerciseResponse(BaseModel):
+    """Відповідь після успішного м'якого видалення (архівації) вправи (REQ-F-022)."""
+
+    exercise_id: str = Field(..., description="Унікальний ідентифікатор архівованої вправи")
+    name: str = Field(..., description="Назва архівованої вправи")
+    is_archived: bool = Field(..., description="Прапорець архівації (завжди true)")
+    archived_at: str = Field(..., description="Час архівації вправи (ISO-8601 UTC)")
 
 
 class ExerciseListResponse(BaseModel):
