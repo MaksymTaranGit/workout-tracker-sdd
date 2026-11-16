@@ -62,9 +62,12 @@ def _to_exercise_dto(row: dict[str, Any]) -> Exercise:
 
 
 def _to_workout_set_dto(
-    row: dict[str, Any], exercise_type: str, body_weight_snapshot: float
+    row: dict[str, Any],
+    exercise_type: str,
+    body_weight_snapshot: float,
+    rm_model: str = "EPLEY",
 ) -> WorkoutSet:
-    """Формує DTO підходу з обчисленням W_eff і set_volume_load (Блок 2)."""
+    """Формує DTO підходу з обчисленням W_eff, set_volume_load (Блок 2) та 1RM (Блок 3)."""
     weight = float(row["weight"])
     reps = int(row["reps"])
     is_warmup = bool(row["is_warmup"])
@@ -74,6 +77,9 @@ def _to_workout_set_dto(
     )
     set_volume_load = MathEngine.calculate_set_volume_load(
         effective_weight, reps, is_warmup
+    )
+    estimated_1rm, soft_constraint_warning, warning_message = MathEngine.calculate_1rm(
+        effective_weight, reps, rm_model, is_warmup
     )
     return WorkoutSet(
         set_id=row["set_id"],
@@ -85,33 +91,40 @@ def _to_workout_set_dto(
         rpe=float(row["rpe"]),
         is_warmup=is_warmup,
         set_volume_load=set_volume_load,
-        estimated_1rm=None,
-        soft_constraint_warning=False,
-        warning_message=None,
+        estimated_1rm=estimated_1rm,
+        soft_constraint_warning=soft_constraint_warning,
+        warning_message=warning_message,
     )
 
 
-def _compute_block_sets_and_volume(
+def _compute_block_sets_and_metrics(
     row: dict[str, Any],
-) -> tuple[list[WorkoutSet], float]:
-    """Обчислює перелік підходів і сумарний Volume Load виключно для одного блоку."""
+) -> tuple[list[WorkoutSet], float, float | None]:
+    """Обчислює перелік підходів, сумарний Volume Load та максимальний 1RM блоку."""
     exercise_type = row["exercise_type"]
     body_weight_snapshot = float(row["body_weight_snapshot"])
+    rm_model = row.get("rm_model", RmModel.EPLEY.value)
     sets = [
-        _to_workout_set_dto(s, exercise_type, body_weight_snapshot)
+        _to_workout_set_dto(s, exercise_type, body_weight_snapshot, rm_model)
         for s in row.get("sets", [])
     ]
     block_volume_load = round(sum(s.set_volume_load for s in sets), 2)
-    return sets, block_volume_load
+    working_1rms = [
+        s.estimated_1rm
+        for s in sets
+        if not s.is_warmup and s.estimated_1rm is not None
+    ]
+    block_max_1rm = max(working_1rms) if working_1rms else None
+    return sets, block_volume_load, block_max_1rm
 
 
 def _build_block_summary_dto(block_row: dict[str, Any]) -> ExerciseBlockSummary:
-    """Повертає актуальне зведення блоку з розрахованим `block_volume_load`."""
-    _, block_volume_load = _compute_block_sets_and_volume(block_row)
+    """Повертає актуальне зведення блоку з `block_volume_load` і `block_max_1rm`."""
+    _, block_volume_load, block_max_1rm = _compute_block_sets_and_metrics(block_row)
     return ExerciseBlockSummary(
         block_id=block_row["block_id"],
         block_volume_load=block_volume_load,
-        block_max_1rm=None,
+        block_max_1rm=block_max_1rm,
         has_previous_baseline=False,
         volume_load_delta=None,
         max_1rm_delta=None,
@@ -119,7 +132,7 @@ def _build_block_summary_dto(block_row: dict[str, Any]) -> ExerciseBlockSummary:
 
 
 def _to_exercise_block_dto(row: dict[str, Any]) -> ExerciseBlock:
-    sets, block_volume_load = _compute_block_sets_and_volume(row)
+    sets, block_volume_load, block_max_1rm = _compute_block_sets_and_metrics(row)
     return ExerciseBlock(
         block_id=row["block_id"],
         session_id=row["session_id"],
@@ -129,7 +142,7 @@ def _to_exercise_block_dto(row: dict[str, Any]) -> ExerciseBlock:
         rm_model=RmModel(row["rm_model"]),
         order_index=int(row["order_index"]),
         block_volume_load=block_volume_load,
-        block_max_1rm=None,
+        block_max_1rm=block_max_1rm,
         has_previous_baseline=False,
         volume_load_delta=None,
         max_1rm_delta=None,
@@ -296,7 +309,28 @@ class WorkoutService:
     def update_exercise_model(
         self, exercise_id: str, payload: UpdateExerciseModelRequest
     ) -> Exercise:
-        raise NotImplementedError("TDD Red Phase: service method not implemented")
+        log_event(
+            TRACE_LEVEL_NUM,
+            "SERVICE",
+            "updateExerciseModel",
+            "Updating exercise 1RM calculation model",
+            context={
+                "exercise_id": exercise_id,
+                "rm_model": payload.rm_model.value,
+            },
+        )
+        updated = self.repository.update_exercise_model(
+            exercise_id=exercise_id,
+            rm_model=payload.rm_model.value,
+        )
+        if updated is None:
+            raise AppError(
+                ErrorCode.ERR_RESOURCE_NOT_FOUND,
+                404,
+                f"Вправу '{exercise_id}' не знайдено.",
+                details={"resource": "exercise", "exercise_id": exercise_id},
+            )
+        return _to_exercise_dto(updated)
 
     def create_session(self, payload: CreateSessionRequest | None = None) -> WorkoutSession:
         log_event(
@@ -505,6 +539,7 @@ class WorkoutService:
                 created_set,
                 block["exercise_type"],
                 float(block["body_weight_snapshot"]),
+                block["rm_model"],
             ),
             block_summary=_build_block_summary_dto(updated_block),
         )

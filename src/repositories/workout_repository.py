@@ -288,7 +288,19 @@ class WorkoutRepository:
         return _row_to_exercise(row) if row is not None else None
 
     def update_exercise_model(self, exercise_id: str, rm_model: str) -> dict[str, Any] | None:
-        raise NotImplementedError("TDD Red Phase: repository method not implemented")
+        if self.get_exercise_by_id(exercise_id) is None:
+            return None
+        updated_at = _utc_now_iso()
+        self.conn.execute(
+            """
+            UPDATE exercises
+            SET rm_model = ?, updated_at = ?
+            WHERE exercise_id = ?;
+            """,
+            (rm_model, updated_at, exercise_id),
+        )
+        self.conn.commit()
+        return self.get_exercise_by_id(exercise_id)
 
     def create_session(
         self,

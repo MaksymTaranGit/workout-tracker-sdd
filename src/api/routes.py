@@ -223,9 +223,9 @@ def update_exercise_model(
     request: Request,
     payload: UpdateExerciseModelRequest,
     exercise_id: str = Path(..., alias="exerciseId", min_length=1),
-    _db: sqlite3.Connection = Depends(get_db),
-) -> JSONResponse:
-    return _not_implemented_stub(
+    service: WorkoutService = Depends(get_workout_service),
+) -> Exercise:
+    _log_api_operation(
         request,
         "updateExerciseModel",
         context={
@@ -233,6 +233,7 @@ def update_exercise_model(
             "payload": payload.model_dump(mode="json"),
         },
     )
+    return service.update_exercise_model(exercise_id, payload)
 
 
 # =====================================================================
