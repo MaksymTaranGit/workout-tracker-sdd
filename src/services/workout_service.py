@@ -1,24 +1,25 @@
 """
 Сервісний шар (Service Layer) для координації репозиторіїв, доменної валідації та телеметрії.
 
-Реалізує бізнес-логіку та доменні правила Блоку 1 (`TKT-02`, `TKT-04`):
+Реалізує бізнес-логіку та доменні правила всіх чотирьох блоків SDD/TDD:
 - управління профілем користувача та обмеженням маси тіла `[30.0, 300.0]` (`REQ-F-019`, `AC10`);
-- управління каталогом вправ та унікальністю назв (`REQ-F-020`, `REQ-F-013`, `AC11`);
+- управління каталогом вправ, унікальністю назв та вибором моделі 1RM (`REQ-F-012`, `REQ-F-013`, `REQ-F-020`, `AC11`);
 - створення сесій із незмінним знімком `body_weight_snapshot` (`REQ-F-001`, `REQ-F-002`, `BDD-001`, `RSK-06`);
 - управління ізольованими блоками вправ (`REQ-F-003`, `RSK-09`);
-- запис і видалення підходів із валідацією RPE та повторень (`REQ-F-004`, `REQ-F-005`, `AC2`, `RSK-02`).
-
-Математичні формули Блоків 2-4 (`MathEngine`) та операції Блоків 3-4 залишаються у фазі RED (`NotImplementedError`).
+- запис і видалення підходів із валідацією RPE, повторень та знака ваги (`REQ-F-004`, `REQ-F-005`, `AC2`, `RSK-02`, `RSK-07`);
+- обчислення `Volume Load`, `1RM`, Дельти прогресії відносно останньої бази та аналітика дашборду (`REQ-F-006` – `REQ-F-018`, `REQ-F-021`).
 """
 
 from __future__ import annotations
 
 import math
+from datetime import date, datetime
 from typing import Any
 
 from src.core.errors import AppError, ErrorCode
 from src.core.logger import TRACE_LEVEL_NUM, log_event
 from src.domain.schemas import (
+    AnalyticsDataPoint,
     CreateExerciseBlockRequest,
     CreateExerciseRequest,
     CreateSessionRequest,
@@ -31,6 +32,7 @@ from src.domain.schemas import (
     ExerciseBlockSummary,
     ExerciseListResponse,
     ExerciseType,
+    LatestProgressionSummary,
     RmModel,
     SessionListResponse,
     UpdateExerciseModelRequest,
@@ -118,36 +120,19 @@ def _compute_block_sets_and_metrics(
     return sets, block_volume_load, block_max_1rm
 
 
-def _build_block_summary_dto(block_row: dict[str, Any]) -> ExerciseBlockSummary:
-    """Повертає актуальне зведення блоку з `block_volume_load` і `block_max_1rm`."""
-    _, block_volume_load, block_max_1rm = _compute_block_sets_and_metrics(block_row)
-    return ExerciseBlockSummary(
-        block_id=block_row["block_id"],
-        block_volume_load=block_volume_load,
-        block_max_1rm=block_max_1rm,
-        has_previous_baseline=False,
-        volume_load_delta=None,
-        max_1rm_delta=None,
-    )
-
-
-def _to_exercise_block_dto(row: dict[str, Any]) -> ExerciseBlock:
-    sets, block_volume_load, block_max_1rm = _compute_block_sets_and_metrics(row)
-    return ExerciseBlock(
-        block_id=row["block_id"],
-        session_id=row["session_id"],
-        exercise_id=row["exercise_id"],
-        exercise_name=row["exercise_name"],
-        exercise_type=ExerciseType(row["exercise_type"]),
-        rm_model=RmModel(row["rm_model"]),
-        order_index=int(row["order_index"]),
-        block_volume_load=block_volume_load,
-        block_max_1rm=block_max_1rm,
-        has_previous_baseline=False,
-        volume_load_delta=None,
-        max_1rm_delta=None,
-        sets=sets,
-    )
+def _parse_iso_date(raw_date: str, param_name: str) -> date:
+    """Валідує рядок дати ISO-8601 (`YYYY-MM-DD` або datetime) і повертає `date` або `400 ERR_BAD_REQUEST`."""
+    try:
+        if len(raw_date) == 10:
+            return date.fromisoformat(raw_date)
+        return datetime.fromisoformat(raw_date.replace("Z", "+00:00")).date()
+    except ValueError as exc:
+        raise AppError(
+            ErrorCode.ERR_BAD_REQUEST,
+            400,
+            f"Некоректний формат дати в параметрі '{param_name}'. Очікується ISO-8601 (YYYY-MM-DD).",
+            details={"field": param_name, "value": raw_date},
+        ) from exc
 
 
 def _validate_set_weight(
@@ -401,13 +386,90 @@ class WorkoutService:
                 f"Тренувальну сесію '{session_id}' не знайдено.",
                 details={"resource": "session", "session_id": session_id},
             )
-        blocks = [_to_exercise_block_dto(b) for b in session["blocks"]]
+        working_blocks_cache: dict[str, list[dict[str, Any]]] = {}
+        blocks = [
+            self._assemble_exercise_block(b, working_blocks_cache=working_blocks_cache)
+            for b in session["blocks"]
+        ]
         return WorkoutSession(
             session_id=session["session_id"],
             started_at=session["started_at"],
             body_weight_snapshot=session["body_weight_snapshot"],
             notes=session["notes"],
             blocks=blocks,
+        )
+
+    def _compute_block_deltas(
+        self,
+        block_row: dict[str, Any],
+        block_volume_load: float,
+        block_max_1rm: float | None,
+        working_blocks_cache: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> tuple[bool, float | None, float | None]:
+        """Обчислює Дельту блоку відносно останнього попереднього робочого блоку цієї вправи."""
+        if block_max_1rm is None:
+            return MathEngine.calculate_deltas(block_volume_load, None, None, None)
+
+        exercise_id = block_row["exercise_id"]
+        if working_blocks_cache is not None and exercise_id in working_blocks_cache:
+            working_blocks = working_blocks_cache[exercise_id]
+        else:
+            working_blocks = self.repository.get_exercise_analytics(exercise_id)
+            if working_blocks_cache is not None:
+                working_blocks_cache[exercise_id] = working_blocks
+
+        block_id = block_row["block_id"]
+        current_idx = next(
+            (i for i, blk in enumerate(working_blocks) if blk["block_id"] == block_id),
+            -1,
+        )
+        if current_idx <= 0:
+            return MathEngine.calculate_deltas(block_volume_load, block_max_1rm, None, None)
+
+        prev_block = working_blocks[current_idx - 1]
+        _, prev_vl, prev_1rm = _compute_block_sets_and_metrics(prev_block)
+        return MathEngine.calculate_deltas(
+            block_volume_load, block_max_1rm, prev_vl, prev_1rm
+        )
+
+    def _assemble_exercise_block(
+        self,
+        row: dict[str, Any],
+        working_blocks_cache: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> ExerciseBlock:
+        sets, block_volume_load, block_max_1rm = _compute_block_sets_and_metrics(row)
+        deltas = self._compute_block_deltas(
+            row,
+            block_volume_load,
+            block_max_1rm,
+            working_blocks_cache=working_blocks_cache,
+        )
+        return ExerciseBlock(
+            block_id=row["block_id"],
+            session_id=row["session_id"],
+            exercise_id=row["exercise_id"],
+            exercise_name=row["exercise_name"],
+            exercise_type=ExerciseType(row["exercise_type"]),
+            rm_model=RmModel(row["rm_model"]),
+            order_index=int(row["order_index"]),
+            block_volume_load=block_volume_load,
+            block_max_1rm=block_max_1rm,
+            has_previous_baseline=deltas[0],
+            volume_load_delta=deltas[1],
+            max_1rm_delta=deltas[2],
+            sets=sets,
+        )
+
+    def _assemble_block_summary(self, block_row: dict[str, Any]) -> ExerciseBlockSummary:
+        _, block_volume_load, block_max_1rm = _compute_block_sets_and_metrics(block_row)
+        deltas = self._compute_block_deltas(block_row, block_volume_load, block_max_1rm)
+        return ExerciseBlockSummary(
+            block_id=block_row["block_id"],
+            block_volume_load=block_volume_load,
+            block_max_1rm=block_max_1rm,
+            has_previous_baseline=deltas[0],
+            volume_load_delta=deltas[1],
+            max_1rm_delta=deltas[2],
         )
 
     def create_exercise_block(
@@ -437,7 +499,7 @@ class WorkoutService:
                 details={"resource": "exercise", "exercise_id": payload.exercise_id},
             )
         block = self.repository.create_exercise_block(session_id, payload.exercise_id)
-        return _to_exercise_block_dto(block)
+        return self._assemble_exercise_block(block)
 
     def get_exercise_block_by_id(
         self, session_id: str, block_id: str
@@ -457,7 +519,7 @@ class WorkoutService:
                 f"Блок вправи '{block_id}' у сесії '{session_id}' не знайдено.",
                 details={"resource": "block", "session_id": session_id, "block_id": block_id},
             )
-        return _to_exercise_block_dto(block)
+        return self._assemble_exercise_block(block)
 
     def create_workout_set(
         self, session_id: str, block_id: str, payload: CreateWorkoutSetRequest
@@ -541,7 +603,7 @@ class WorkoutService:
                 float(block["body_weight_snapshot"]),
                 block["rm_model"],
             ),
-            block_summary=_build_block_summary_dto(updated_block),
+            block_summary=self._assemble_block_summary(updated_block),
         )
 
     def delete_workout_set(
@@ -585,8 +647,123 @@ class WorkoutService:
         assert updated_block is not None
         return DeleteWorkoutSetResponse(
             deleted_set_id=deleted_set["set_id"],
-            block_summary=_build_block_summary_dto(updated_block),
+            block_summary=self._assemble_block_summary(updated_block),
         )
 
-    def get_exercise_analytics(self, exercise_id: str) -> ExerciseAnalyticsResponse:
-        raise NotImplementedError("TDD Red Phase: service method not implemented")
+    def get_exercise_analytics(
+        self,
+        exercise_id: str,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        limit: int = 50,
+    ) -> ExerciseAnalyticsResponse:
+        log_event(
+            TRACE_LEVEL_NUM,
+            "SERVICE",
+            "getExerciseAnalytics",
+            "Building exercise analytics progression and time series",
+            context={
+                "exercise_id": exercise_id,
+                "from_date": from_date,
+                "to_date": to_date,
+                "limit": limit,
+            },
+        )
+        exercise = self.repository.get_exercise_by_id(exercise_id)
+        if exercise is None:
+            raise AppError(
+                ErrorCode.ERR_RESOURCE_NOT_FOUND,
+                404,
+                f"Вправу '{exercise_id}' не знайдено.",
+                details={"resource": "exercise", "exercise_id": exercise_id},
+            )
+
+        parsed_from = _parse_iso_date(from_date, "from_date") if from_date is not None else None
+        parsed_to = _parse_iso_date(to_date, "to_date") if to_date is not None else None
+        if parsed_from is not None and parsed_to is not None and parsed_from > parsed_to:
+            raise AppError(
+                ErrorCode.ERR_BAD_REQUEST,
+                400,
+                "Початкова дата 'from_date' не може перевищувати кінцеву дату 'to_date'.",
+                details={"from_date": from_date, "to_date": to_date},
+            )
+
+        working_blocks = self.repository.get_exercise_analytics(exercise_id)
+
+        all_points: list[AnalyticsDataPoint] = []
+        prev_volume: float | None = None
+        prev_max_1rm: float | None = None
+
+        for blk in working_blocks:
+            _, cur_vl, cur_1rm = _compute_block_sets_and_metrics(blk)
+            _, vl_delta, rm_delta = MathEngine.calculate_deltas(
+                cur_vl, cur_1rm, prev_volume, prev_max_1rm
+            )
+            all_points.append(
+                AnalyticsDataPoint(
+                    session_id=blk["session_id"],
+                    block_id=blk["block_id"],
+                    performed_at=blk["started_at"],
+                    body_weight_snapshot=float(blk["body_weight_snapshot"]),
+                    block_volume_load=cur_vl,
+                    block_max_1rm=cur_1rm,
+                    volume_load_delta=vl_delta,
+                    max_1rm_delta=rm_delta,
+                )
+            )
+            prev_volume = cur_vl
+            prev_max_1rm = cur_1rm
+
+        if not all_points:
+            latest_progression = LatestProgressionSummary(has_previous_baseline=False)
+        elif len(all_points) == 1:
+            cur = all_points[0]
+            latest_progression = LatestProgressionSummary(
+                has_previous_baseline=False,
+                current_block_id=cur.block_id,
+                previous_block_id=None,
+                current_volume_load=cur.block_volume_load,
+                previous_volume_load=None,
+                volume_load_delta=None,
+                current_max_1rm=cur.block_max_1rm,
+                previous_max_1rm=None,
+                max_1rm_delta=None,
+            )
+        else:
+            prev, cur = all_points[-2], all_points[-1]
+            latest_progression = LatestProgressionSummary(
+                has_previous_baseline=True,
+                current_block_id=cur.block_id,
+                previous_block_id=prev.block_id,
+                current_volume_load=cur.block_volume_load,
+                previous_volume_load=prev.block_volume_load,
+                volume_load_delta=cur.volume_load_delta,
+                current_max_1rm=cur.block_max_1rm,
+                previous_max_1rm=prev.block_max_1rm,
+                max_1rm_delta=cur.max_1rm_delta,
+            )
+
+        filtered_points = all_points
+        if parsed_from is not None:
+            filtered_points = [
+                p
+                for p in filtered_points
+                if date.fromisoformat(p.performed_at[:10]) >= parsed_from
+            ]
+        if parsed_to is not None:
+            filtered_points = [
+                p
+                for p in filtered_points
+                if date.fromisoformat(p.performed_at[:10]) <= parsed_to
+            ]
+        if len(filtered_points) > limit:
+            filtered_points = filtered_points[-limit:]
+
+        return ExerciseAnalyticsResponse(
+            exercise_id=exercise["exercise_id"],
+            exercise_name=exercise["name"],
+            exercise_type=ExerciseType(exercise["exercise_type"]),
+            rm_model=RmModel(exercise["rm_model"]),
+            latest_progression=latest_progression,
+            data_points=filtered_points,
+        )
