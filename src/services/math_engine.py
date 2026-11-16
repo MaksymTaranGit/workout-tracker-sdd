@@ -1,14 +1,18 @@
 """
 Математичний рушій (Math Engine) системи.
 
-Реалізує розрахунки Етапу 2 / Блоку 2 (`TKT-09`, `TKT-11`):
+Реалізує розрахунки Етапів 2-3 (`TKT-09`, `TKT-11`, `TKT-16`, `TKT-18`):
 - Ефективна вага $W_{eff}$ для `STANDARD`, `BODYWEIGHT` та `ASSISTED` (`REQ-F-008` – `REQ-F-010`, `REQ-F-021`);
-- Механічна робота підходу `Volume Load` з виключенням розминки (`REQ-F-006`, `REQ-F-007`, `BDD-003`).
+- Механічна робота підходу `Volume Load` з виключенням розминки (`REQ-F-006`, `REQ-F-007`, `BDD-003`);
+- Розрахунок одноповторного максимуму `1RM` за моделями `EPLEY` і `BRZYCKI` з високоточною
+  арифметикою `Decimal` (`ROUND_DOWN`) та попередженням Soft Constraint (`REQ-F-011` – `REQ-F-014`, `RSK-01`, `RSK-02`).
 
-Методи Блоків 3-4 (`calculate_1rm`, `calculate_deltas`) залишаються у фазі RED (`NotImplementedError`).
+Метод Блоку 4 (`calculate_deltas`) залишається у фазі RED (`NotImplementedError`).
 """
 
 from __future__ import annotations
+
+from decimal import Decimal, ROUND_DOWN
 
 from src.core.logger import TRACE_LEVEL_NUM, log_event
 
@@ -70,7 +74,63 @@ class MathEngine:
     def calculate_1rm(
         effective_weight: float, reps: int, rm_model: str, is_warmup: bool
     ) -> tuple[float | None, bool, str | None]:
-        raise NotImplementedError("TDD Red Phase: math engine method not implemented")
+        """
+        Обчислює оціночний 1RM за моделями EPLEY або BRZYCKI (`Decimal`, `ROUND_DOWN` до 0.01)
+        та формує попередження Soft Constraint при кількості повторень > 10 (`REQ-F-014`).
+        """
+        if is_warmup:
+            log_event(
+                TRACE_LEVEL_NUM,
+                "MATH_ENGINE",
+                "calculate_1rm",
+                "Skipped 1RM calculation for warmup set",
+                context={
+                    "effective_weight": float(effective_weight),
+                    "reps": int(reps),
+                    "rm_model": rm_model,
+                    "is_warmup": True,
+                    "estimated_1rm": None,
+                    "soft_constraint_warning": False,
+                },
+            )
+            return None, False, None
+
+        w_dec = Decimal(str(effective_weight))
+        r_int = int(reps)
+        r_dec = Decimal(r_int)
+
+        if rm_model == "EPLEY":
+            raw_1rm = (w_dec * (Decimal(30) + r_dec)) / Decimal(30)
+        elif rm_model == "BRZYCKI":
+            if r_int < 1 or r_int > 36:
+                raise ValueError(f"Brzycki reps must be in [1, 36], got {r_int}")
+            raw_1rm = (w_dec * Decimal(36)) / (Decimal(37) - r_dec)
+        else:
+            raise ValueError(f"Unsupported rm_model: {rm_model}")
+
+        estimated_1rm = float(raw_1rm.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+        soft_constraint_warning = r_int > 10
+        warning_message = (
+            f"Кількість повторень перевищує 10 (R={r_int}). Розрахункове значення 1RM має знижену точність (REQ-F-014)."
+            if soft_constraint_warning
+            else None
+        )
+
+        log_event(
+            TRACE_LEVEL_NUM,
+            "MATH_ENGINE",
+            "calculate_1rm",
+            "Calculated estimated 1RM",
+            context={
+                "effective_weight": float(effective_weight),
+                "reps": r_int,
+                "rm_model": rm_model,
+                "is_warmup": False,
+                "estimated_1rm": estimated_1rm,
+                "soft_constraint_warning": soft_constraint_warning,
+            },
+        )
+        return estimated_1rm, soft_constraint_warning, warning_message
 
     @staticmethod
     def calculate_deltas(
