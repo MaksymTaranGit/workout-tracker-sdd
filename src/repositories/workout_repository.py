@@ -48,6 +48,8 @@ def _row_to_exercise(row: sqlite3.Row) -> dict[str, Any]:
         "name": row["name"],
         "exercise_type": row["exercise_type"],
         "rm_model": row["rm_model"],
+        "is_archived": bool(row["is_archived"]),
+        "archived_at": row["archived_at"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -96,6 +98,24 @@ class WorkoutRepository:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
 
+    def _ensure_exercises_archiving_columns(self) -> None:
+        """Безпечно додає стовпці `is_archived` та `archived_at` у вже існуючу таблицю `exercises`."""
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(exercises);").fetchall()
+        }
+        migrated = False
+        if "is_archived" not in cols:
+            self.conn.execute(
+                "ALTER TABLE exercises ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0;"
+            )
+            migrated = True
+        if "archived_at" not in cols:
+            self.conn.execute("ALTER TABLE exercises ADD COLUMN archived_at TEXT;")
+            migrated = True
+        if migrated:
+            self.conn.commit()
+
     def init_schema(self) -> None:
         """Створює таблиці БД за відсутності та ініціалізує дефолтний профіль користувача."""
         self.conn.execute("PRAGMA foreign_keys = ON;")
@@ -108,6 +128,7 @@ class WorkoutRepository:
             """
         ).fetchone()
         if tables_row is not None and int(tables_row["cnt"]) == 5:
+            self._ensure_exercises_archiving_columns()
             has_profile = self.conn.execute(
                 "SELECT 1 FROM user_profile LIMIT 1;"
             ).fetchone()
@@ -135,12 +156,18 @@ class WorkoutRepository:
             """
             CREATE TABLE IF NOT EXISTS exercises (
                 exercise_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
                 exercise_type TEXT NOT NULL,
                 rm_model TEXT NOT NULL DEFAULT 'EPLEY',
+                is_archived INTEGER NOT NULL DEFAULT 0,
+                archived_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT
             );
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_exercises_active_name
+            ON exercises(name) WHERE is_archived = 0;
             """,
             """
             CREATE TABLE IF NOT EXISTS workout_sessions (
@@ -225,12 +252,17 @@ class WorkoutRepository:
         assert updated is not None
         return _row_to_profile(updated)
 
+    _EXERCISE_COLUMNS = (
+        "exercise_id, name, exercise_type, rm_model, "
+        "is_archived, archived_at, created_at, updated_at"
+    )
+
     def get_exercise_by_name(self, name: str) -> dict[str, Any] | None:
         row = self.conn.execute(
-            """
-            SELECT exercise_id, name, exercise_type, rm_model, created_at, updated_at
+            f"""
+            SELECT {self._EXERCISE_COLUMNS}
             FROM exercises
-            WHERE name = ?;
+            WHERE name = ? AND is_archived = 0;
             """,
             (name,),
         ).fetchone()
@@ -243,8 +275,11 @@ class WorkoutRepository:
         created_at = _utc_now_iso()
         self.conn.execute(
             """
-            INSERT INTO exercises (exercise_id, name, exercise_type, rm_model, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, NULL);
+            INSERT INTO exercises (
+                exercise_id, name, exercise_type, rm_model,
+                is_archived, archived_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, 0, NULL, ?, NULL);
             """,
             (exercise_id, name, exercise_type, rm_model, created_at),
         )
@@ -257,19 +292,20 @@ class WorkoutRepository:
     def list_exercises(self, exercise_type: str | None = None) -> list[dict[str, Any]]:
         if exercise_type is not None:
             rows = self.conn.execute(
-                """
-                SELECT exercise_id, name, exercise_type, rm_model, created_at, updated_at
+                f"""
+                SELECT {self._EXERCISE_COLUMNS}
                 FROM exercises
-                WHERE exercise_type = ?
+                WHERE exercise_type = ? AND is_archived = 0
                 ORDER BY created_at ASC, rowid ASC;
                 """,
                 (exercise_type,),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                """
-                SELECT exercise_id, name, exercise_type, rm_model, created_at, updated_at
+                f"""
+                SELECT {self._EXERCISE_COLUMNS}
                 FROM exercises
+                WHERE is_archived = 0
                 ORDER BY created_at ASC, rowid ASC;
                 """
             ).fetchall()
@@ -277,8 +313,8 @@ class WorkoutRepository:
 
     def get_exercise_by_id(self, exercise_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
-            """
-            SELECT exercise_id, name, exercise_type, rm_model, created_at, updated_at
+            f"""
+            SELECT {self._EXERCISE_COLUMNS}
             FROM exercises
             WHERE exercise_id = ?;
             """,
@@ -297,6 +333,23 @@ class WorkoutRepository:
             WHERE exercise_id = ?;
             """,
             (rm_model, updated_at, exercise_id),
+        )
+        self.conn.commit()
+        return self.get_exercise_by_id(exercise_id)
+
+    def archive_exercise(self, exercise_id: str) -> dict[str, Any] | None:
+        """Позначає вправу як архівовану (Soft Delete); повертає None, якщо не знайдено або вже архівовано."""
+        existing = self.get_exercise_by_id(exercise_id)
+        if existing is None or existing["is_archived"]:
+            return None
+        now = _utc_now_iso()
+        self.conn.execute(
+            """
+            UPDATE exercises
+            SET is_archived = 1, archived_at = ?, updated_at = ?
+            WHERE exercise_id = ?;
+            """,
+            (now, now, exercise_id),
         )
         self.conn.commit()
         return self.get_exercise_by_id(exercise_id)

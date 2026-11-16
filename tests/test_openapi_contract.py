@@ -60,7 +60,7 @@ def test_openapi_all_14_routes_and_operation_ids_match_fastapi() -> None:
             if method.lower() in HTTP_METHODS:
                 spec_operations[(path, method.upper())] = operation["operationId"]
 
-    assert len(spec_operations) == 14
+    assert len(spec_operations) == 15
 
     fastapi_operations: dict[tuple[str, str], str] = {}
     for route in _iter_api_routes(app.routes):
@@ -69,6 +69,7 @@ def test_openapi_all_14_routes_and_operation_ids_match_fastapi() -> None:
                 if method.lower() in HTTP_METHODS:
                     fastapi_operations[(route.path, method.upper())] = route.operation_id
 
+    assert len(fastapi_operations) == 15
     assert fastapi_operations == spec_operations
 
     # Додаткова перевірка runtime OpenAPI-схеми, згенерованої FastAPI

@@ -309,6 +309,33 @@ paths:
         '404':
           $ref: '#/components/responses/NotFoundError'
 
+    delete:
+      tags:
+        - Exercises
+      operationId: deleteExercise
+      summary: "М'яке видалення (архівація) вправи з каталогу зі збереженням історії (REQ-F-022, AC13, BDD-008)"
+      description: |
+        Виконує м'яке видалення (Soft Delete) вправи з каталогу: позначає запис як архівований (`is_archived = true`, фіксує `archived_at`), приховує вправу з активного списку `GET /api/v1/exercises` та блокує додавання до нових сесій (`422 ERR_EXERCISE_ARCHIVED`), зберігаючи історичні сесії та аналітику.
+        Повторний виклик для вже архівованої або неіснуючої вправи повертає `404 ERR_RESOURCE_NOT_FOUND`.
+        **Пов'язані вимоги:** `REQ-F-022`, `AC13`, `BDD-008`, ризик `RSK-10`.
+      responses:
+        '200':
+          description: Вправу успішно архівовано (Soft Delete).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArchiveExerciseResponse'
+              examples:
+                archivedSquatExercise:
+                  summary: Архівування вправи (BDD-008)
+                  value:
+                    exercise_id: "ex-7701-4a2b-9c11-000000000001"
+                    name: "Присідання зі штангою"
+                    is_archived: true
+                    archived_at: "2026-11-16T19:00:00Z"
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
   /api/v1/sessions:
     post:
       tags:
@@ -537,6 +564,24 @@ paths:
           $ref: '#/components/responses/BadRequestError'
         '404':
           $ref: '#/components/responses/NotFoundError'
+        '422':
+          description: Неможливо додати архівовану вправу до нової тренувальної сесії (REQ-F-022, BDD-008).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                exerciseArchivedError:
+                  summary: "ERR_EXERCISE_ARCHIVED — Заборона додавання архівованої вправи"
+                  value:
+                    error:
+                      code: "ERR_EXERCISE_ARCHIVED"
+                      http_status: 422
+                      message: "Вправу архівовано і її не можна додавати до нових тренувальних сесій (REQ-F-022)."
+                      details:
+                        exercise_id: "ex-7701-4a2b-9c11-000000000001"
+                        is_archived: true
+                      trace_id: "trc-blk-422-archived"
 
   /api/v1/sessions/{sessionId}/blocks/{blockId}:
     parameters:
@@ -1136,6 +1181,45 @@ components:
           format: date-time
           readOnly: true
           example: "2026-09-01T08:45:00Z"
+        is_archived:
+          type: boolean
+          default: false
+          readOnly: true
+          description: "Прапорець архівації вправи (Soft Delete, REQ-F-022)"
+          example: false
+        archived_at:
+          type: string
+          format: date-time
+          nullable: true
+          readOnly: true
+          description: "Час архівації вправи (ISO-8601 UTC) або null для активної вправи"
+          example: null
+
+    ArchiveExerciseResponse:
+      type: object
+      description: "Відповідь при м'якому видаленні (архівації) вправи з каталогу (REQ-F-022, AC13)"
+      required:
+        - exercise_id
+        - name
+        - is_archived
+        - archived_at
+      properties:
+        exercise_id:
+          type: string
+          readOnly: true
+          example: "ex-7701-4a2b-9c11-000000000001"
+        name:
+          type: string
+          example: "Присідання зі штангою"
+        is_archived:
+          type: boolean
+          readOnly: true
+          example: true
+        archived_at:
+          type: string
+          format: date-time
+          readOnly: true
+          example: "2026-11-16T19:00:00Z"
 
     ExerciseListResponse:
       type: object
@@ -1727,6 +1811,7 @@ components:
             - ERR_INVALID_BODY_WEIGHT
             - ERR_PROFILE_WEIGHT_MISSING
             - ERR_DUPLICATE_EXERCISE_NAME
+            - ERR_EXERCISE_ARCHIVED
           example: "ERR_RPE_OUT_OF_RANGE"
         http_status:
           type: integer

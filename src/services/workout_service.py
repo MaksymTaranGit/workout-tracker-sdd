@@ -15,6 +15,7 @@ from src.core.errors import AppError, ErrorCode
 from src.core.logger import TRACE_LEVEL_NUM, log_event
 from src.domain.schemas import (
     AnalyticsDataPoint,
+    ArchiveExerciseResponse,
     CreateExerciseBlockRequest,
     CreateExerciseRequest,
     CreateSessionRequest,
@@ -68,6 +69,8 @@ def _to_exercise_dto(row: dict[str, Any]) -> Exercise:
         name=row["name"],
         exercise_type=ExerciseType(row["exercise_type"]),
         rm_model=RmModel(row["rm_model"]),
+        is_archived=bool(row.get("is_archived", False)),
+        archived_at=row.get("archived_at"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -248,6 +251,26 @@ class WorkoutService:
         )
         return _to_exercise_dto(updated)
 
+    def delete_exercise(self, exercise_id: str) -> ArchiveExerciseResponse:
+        log_event(
+            TRACE_LEVEL_NUM,
+            "SERVICE",
+            "deleteExercise",
+            "Archiving exercise (soft delete) in catalog",
+            context={"exercise_id": exercise_id},
+        )
+        archived = _require_resource(
+            self.repository.archive_exercise(exercise_id),
+            f"Активну вправу '{exercise_id}' не знайдено.",
+            details={"resource": "exercise", "exercise_id": exercise_id},
+        )
+        return ArchiveExerciseResponse(
+            exercise_id=archived["exercise_id"],
+            name=archived["name"],
+            is_archived=bool(archived["is_archived"]),
+            archived_at=archived["archived_at"],
+        )
+
     def create_session(self, payload: CreateSessionRequest | None = None) -> WorkoutSession:
         log_event(
             TRACE_LEVEL_NUM,
@@ -410,11 +433,22 @@ class WorkoutService:
             f"Тренувальну сесію '{session_id}' не знайдено.",
             details={"resource": "session", "session_id": session_id},
         )
-        _require_resource(
+        exercise = _require_resource(
             self.repository.get_exercise_by_id(payload.exercise_id),
             f"Вправу '{payload.exercise_id}' не знайдено в каталозі.",
             details={"resource": "exercise", "exercise_id": payload.exercise_id},
         )
+        if exercise["is_archived"]:
+            raise AppError(
+                ErrorCode.ERR_EXERCISE_ARCHIVED,
+                422,
+                f"Вправу '{payload.exercise_id}' архівовано, її не можна додати до нової сесії.",
+                details={
+                    "resource": "exercise",
+                    "exercise_id": payload.exercise_id,
+                    "is_archived": True,
+                },
+            )
         block = self.repository.create_exercise_block(session_id, payload.exercise_id)
         return self._assemble_exercise_block(block)
 
